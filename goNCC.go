@@ -63,6 +63,9 @@ type Config struct {
 	RetryMaxAttempts int
 	RetryBaseDelay   time.Duration
 	RetryMaxDelay    time.Duration
+
+	// Prometheus metrics
+	PromDir string `mapstructure:"prom-dir"`
 }
 
 const termsText = `
@@ -338,6 +341,10 @@ func bindConfig() (Config, error) {
 	if cfg.LogFile == "" {
 		cfg.LogFile = "logs/ncc-runner.log"
 	}
+	cfg.PromDir = viper.GetString("prom-dir")
+	if cfg.PromDir == "" {
+		cfg.PromDir = "promfiles"
+	}
 	if cfg.RetryMaxAttempts <= 0 {
 		cfg.RetryMaxAttempts = 6
 	}
@@ -526,6 +533,83 @@ func (OSFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 func (OSFS) ReadFile(path string) ([]byte, error)       { return os.ReadFile(path) }
 func (OSFS) ReadDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
 func (OSFS) Create(path string) (*os.File, error)       { return os.Create(path) }
+
+/************** Prometheus metrics **************/
+// sanitizeLabel ensures Prometheus label values are safe-ish (no newlines, quotes escaped).
+func sanitizeLabel(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", " ")
+	return s
+}
+
+func writePrometheusFile(fs FS, promDir, cluster string, blocks []ParsedBlock) error {
+	if err := fs.MkdirAll(promDir, 0755); err != nil {
+		return err
+	}
+	filename := filepath.Join(promDir, fmt.Sprintf("%s.prom", cluster))
+
+	var b strings.Builder
+
+	// Metric headers.
+	b.WriteString(`# HELP nutanix_ncc_check_result Result of an NCC check (1 = present)` + "\n")
+	b.WriteString(`# TYPE nutanix_ncc_check_result gauge` + "\n")
+	b.WriteString(`# HELP nutanix_ncc_check_summary_total Number of NCC checks per severity` + "\n")
+	b.WriteString(`# TYPE nutanix_ncc_check_summary_total gauge` + "\n")
+	b.WriteString(`# HELP nutanix_ncc_check_total Total NCC checks for this cluster` + "\n")
+	b.WriteString(`# TYPE nutanix_ncc_check_total gauge` + "\n")
+
+	// Per-check result metrics.
+	counts := map[string]int{
+		"FAIL": 0,
+		"WARN": 0,
+		"ERR":  0,
+		"INFO": 0,
+		"PASS": 0, // in case parser ever maps PASS
+	}
+
+	for _, pb := range blocks {
+		sev := pb.Severity
+		if sev == "" {
+			sev = "INFO"
+		}
+		if _, ok := counts[sev]; !ok {
+			counts[sev] = 0
+		}
+		counts[sev]++
+
+		// one sample per check
+		b.WriteString(fmt.Sprintf(
+			`nutanix_ncc_check_result{cluster="%s",check="%s",severity="%s"}`+"\n",
+			sanitizeLabel(cluster),
+			sanitizeLabel(pb.CheckName),
+			sanitizeLabel(sev),
+		))
+	}
+
+	// Summary per severity.
+	for sev, c := range counts {
+		if c == 0 {
+			continue
+		}
+		b.WriteString(fmt.Sprintf(
+			`nutanix_ncc_check_summary_total{cluster="%s",severity="%s"} %d`+"\n",
+			sanitizeLabel(cluster),
+			sanitizeLabel(sev),
+			c,
+		))
+	}
+
+	// Total checks.
+	b.WriteString(fmt.Sprintf(
+		`nutanix_ncc_check_total{cluster="%s"} %d`+"\n",
+		sanitizeLabel(cluster),
+		len(blocks),
+	))
+
+	return fs.WriteFile(filename, []byte(b.String()), 0644)
+}
 
 /************** API Types **************/
 
@@ -1795,6 +1879,7 @@ SUMMARY:
 
 	base := filteredPath
 	for _, f := range cfg.OutputFormats {
+		_ = writePrometheusFile(fs, cfg.PromDir, cluster, blocks)
 		switch strings.ToLower(strings.TrimSpace(f)) {
 		case "html":
 			htmlFile := base + ".html"
@@ -1813,6 +1898,10 @@ SUMMARY:
 		default:
 			l.Warn().Str("format", f).Msg("unknown output format")
 		}
+		if err := writePrometheusFile(fs, cfg.PromDir, cluster, blocks); err != nil {
+			l.Error().Err(err).Msg("write Prometheus .prom failed")
+		}
+		log.Info().Str("cluster", cluster).Str("prom_dir", cfg.PromDir).Msg("Prometheus .prom written")
 	}
 
 	setPhase("done")
@@ -1940,7 +2029,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				Msg("starting NCC orchestrator")
 
 			if tc, _ := cmd.Flags().GetBool("tc"); tc {
-				fmt.Println(termsText)
+				fmt.Print(termsText)
 				return nil
 			}
 			if len(cfg.Clusters) == 0 {
@@ -1997,6 +2086,9 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 			if err := fs.MkdirAll(cfg.OutputDirFiltered, 0755); err != nil {
 				return err
 			}
+			if err := fs.MkdirAll(cfg.PromDir, 0755); err != nil {
+				return err
+			}
 
 			// Fast replay mode: skip API, parse existing logs and render everything
 			if cmd.Flags().Changed("replay") && viper.GetBool("replay") {
@@ -2034,12 +2126,17 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 					// Per-cluster outputs
 					base := filtered
 					for _, f := range cfg.OutputFormats {
+						_ = writePrometheusFile(fs, cfg.PromDir, cluster, blocks)
 						switch strings.ToLower(strings.TrimSpace(f)) {
 						case "html":
 							_ = generateHTML(OSFS{}, rowsFromBlocks(blocks), base+".html")
 						case "csv":
 							_ = generateCSV(OSFS{}, blocks, base+".csv")
 						}
+						if err := writePrometheusFile(OSFS{}, cfg.PromDir, cluster, blocks); err != nil {
+							log.Error().Str("cluster", cluster).Err(err).Msg("replay write Prometheus .prom failed")
+						}
+						log.Info().Str("cluster", cluster).Str("prom_dir", cfg.PromDir).Msg("replay: Prometheus .prom written")
 					}
 
 					clusterFiles = append(clusterFiles, struct{ Cluster, HTML, CSV string }{
@@ -2223,6 +2320,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().String("retry-base-delay", "400ms", "Base retry delay (with jitter, exponential)")
 	cmd.Flags().String("retry-max-delay", "8s", "Max retry delay cap")
 	cmd.Flags().Bool("replay", false, "Replay from existing logs without running NCC")
+	cmd.Flags().String("prom-dir", "promfiles", "Directory for Prometheus metrics")
 
 	// viper bindings
 	_ = viper.BindPFlag("config", cmd.Flags().Lookup("config"))
@@ -2245,6 +2343,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	_ = viper.BindPFlag("retry-base-delay", cmd.Flags().Lookup("retry-base-delay"))
 	_ = viper.BindPFlag("retry-max-delay", cmd.Flags().Lookup("retry-max-delay"))
 	_ = viper.BindPFlag("replay", cmd.Flags().Lookup("replay"))
+	_ = viper.BindPFlag("prom-dir", cmd.Flags().Lookup("prom-dir"))
 
 	return cmd
 }
