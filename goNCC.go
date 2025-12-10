@@ -543,7 +543,7 @@ type NCCSummary struct {
 var (
 	reBlockStart = regexp.MustCompile(`^Detailed information for .*`)
 	reBlockEnd   = regexp.MustCompile(`^Refer to.*`)
-	reSeverity   = regexp.MustCompile(`\b(FAIL|WARN|INFO|ERR):`)
+	reSeverity   = regexp.MustCompile(`\b(FAIL|WARN|INFO|ERR)\s*:`)
 )
 
 type Row struct {
