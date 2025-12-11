@@ -12,6 +12,7 @@ config.yaml
 nccfiles/
 outputfiles/
 logs/
+dist/
 
 # Prometheus metrics
 promfiles/
