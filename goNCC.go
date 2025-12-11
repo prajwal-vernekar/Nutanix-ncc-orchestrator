@@ -1956,12 +1956,10 @@ func init() {
 			GoVersion = bi.GoVersion
 		}
 	}
-	if Version == "" {
-		if gitRevision != "" {
-			Version = gitRevision
-		} else {
-			Version = "unknown"
-		}
+	if gitRevision != "" {
+		Version = Version + "-" + gitRevision
+	} else {
+		Version = "unknown"
 	}
 	if BuildDate == "" {
 		BuildDate = "unknown" // Override at build time with -ldflags

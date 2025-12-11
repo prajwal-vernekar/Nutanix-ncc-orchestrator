@@ -9,17 +9,20 @@ A CLI tool to run NCC (Nutanix Cluster Check) across multiple clusters in parall
 - Output formats: HTML reports with styling, CSV exports.
 - Retry logic, logging, and progress bars for reliability.
 - Replay mode to generate reports from existing logs without re-running checks.
+- Prometheus exporter for data visualisation
 
 ## Installation
 ### Prerequisites
-- Go 1.20+ (for building from source).
-- Nutanix Prism access (username, password, cluster IPs).
+- Go 1.24+ (for building binaries from source).
+- Nutanix Prism API access (username, password, cluster IPs).
 
 ### From Source
 1. Clone the repo: `git clone https://github.com/lTSPV75BRO/Nutanix-ncc-orchestrator.git`
 2. Navigate to the directory: `cd Nutanix-ncc-orchestrator`
-3. Build: `go build -ldflags "-w -s -X main.Version=Custom_Build -X main.BuildDate=$(date -u '+%Y-%m-%dT%H:%M:%SZ') -X main.Stream=Beta -X main.GoVersion=$(go version | cut -d ' ' -f 3)" -o ncc-orchestrator goNCC.go`
-4. Run: `./ncc-orchestrator --help`
+3. Build: `go build -ldflags "-w -s -X main.BuildDate=$(date -u '+%Y-%m-%dT%H:%M:%SZ') -X main.Stream=Beta -X main.GoVersion=$(go version | cut -d ' ' -f 3)" -o ncc-orchestrator`
+4. Run: `./ncc-orchestrator --help` Or `./ncc-orchestrator --version`
+   
+  > Add .exe for windows binary.
 
 ### Binary Releases
 Download pre-built binaries for Linux/Windows/macOS from the [Releases](https://github.com/lTSPV75BRO/Nutanix-ncc-orchestrator/releases) page.
@@ -28,11 +31,12 @@ Download pre-built binaries for Linux/Windows/macOS from the [Releases](https://
 Basic command:
 - `ncc-orchestrator --clusters "10.0.1.1,10.0.2.1" --username admin --password yourpassword`
 
-Full options: Run `ncc-orchestrator --help` for details on flags like `--config`, `--outputs`, `--max-parallel`, etc.
+Full options: Run `ncc-orchestrator --help` for details on flags like `--config`, `--insecure-skip-verify`, `--max-parallel`, etc.
 
 ### Configuration
 Create a `config.yaml`:
 
+```
 clusters: "10.2.XX.XX,10.0.XX.XX"      	  # Comma-separated list of Prism Element cluster IPs/cluster FQDNs
 username: "admin"                         # Prism element username
 password: ""                              # Prefer env NCC_PASSWORD in CLI; leave empty here if using env
@@ -51,7 +55,7 @@ log-http: false                           # Set true only for debugging; logs re
 retry-max-attempts: 6                     # Max attempts per request  
 retry-base-delay: "400ms"                 # Base backoff delay  
 retry-max-delay: "8s"                     # Max jittered backoff delay  
-
+```
 
 Run with: `ncc-orchestrator --config config.yaml`
 
