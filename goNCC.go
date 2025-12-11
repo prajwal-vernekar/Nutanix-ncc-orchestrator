@@ -1937,7 +1937,7 @@ func promptPasswordIfEmpty(p string, Username string) (string, error) {
 }
 
 var (
-	Version   string
+	Version   string = "0.1.7"
 	BuildDate string
 	GoVersion string
 	Stream    string // e.g., "prod", "dev", "beta"
