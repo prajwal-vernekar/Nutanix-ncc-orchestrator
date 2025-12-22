@@ -581,7 +581,7 @@ func writePrometheusFile(fs FS, promDir, cluster string, blocks []ParsedBlock) e
 
 		// one sample per check
 		b.WriteString(fmt.Sprintf(
-			`nutanix_ncc_check_result{cluster="%s",check="%s",severity="%s"}`+"\n",
+			`nutanix_ncc_check_result{cluster="%s",check="%s",severity="%s"} 1`+"\n",
 			sanitizeLabel(cluster),
 			sanitizeLabel(pb.CheckName),
 			sanitizeLabel(sev),
