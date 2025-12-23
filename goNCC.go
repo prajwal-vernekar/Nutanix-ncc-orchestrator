@@ -2170,7 +2170,7 @@ func init() {
 		BuildDate = "unknown" // Override at build time with -ldflags
 	}
 	if Stream == "" {
-		Stream = "dev" // Default; override via build or config
+		Stream = "Alpha" // Default; override via build or config
 	}
 }
 

@@ -1,6 +1,6 @@
 # Nutanix NCC Orchestrator + Prometheus Monitoring
 
-monitoring for Nutanix clusters using NCC Orchestrator → node_exporter textfile collector → Prometheus → Grafana)
+monitoring for Nutanix clusters using NCC Orchestrator → node_exporter textfile collector → Prometheus → Grafana
 ​
 
 ## Architecture
@@ -17,9 +17,9 @@ Grafana (:3000) + Alerts
 Metrics Exposed
 | Metric	| Type	| Description | PromQL Example|
 | --------| ---------| ---------------------- | -------------- |
-|`nutanix_ncc_check_result`	| gauge	| Individual NCC checks (1=present)	| nutanix_ncc_check_result{severity="FAIL"}
+|`nutanix_ncc_check_result`	| gauge	| Individual NCC checks (1=present)|nutanix_ncc_check_result{severity="FAIL"}
 |`​nutanix_ncc_check_summary_total`	| gauge	| Counts per severity	|sum(nutanix_ncc_check_summary_total{severity="FAIL"}) by (cluster)|
-|`nutanix_ncc_check_total`	| gauge	| Total checks per cluster	|nutanix_ncc_check_total|
+|`nutanix_ncc_check_total`	| gauge	| Total checks per cluster	|nutanix_ncc_check_total |
 
 
 ## Prerequisites
@@ -134,10 +134,10 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9100']
     scrape_interval: 5m
-
-```
   - rule_files:  
     - /etc/prometheus/ncc.rules.yml
+```
+  - Alerting Rules:  
 
 ```
 # Rules: /etc/prometheus/ncc.rules.yml
