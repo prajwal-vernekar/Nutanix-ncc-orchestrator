@@ -1937,7 +1937,7 @@ func promptPasswordIfEmpty(p string, Username string) (string, error) {
 }
 
 var (
-	Version   string = "0.1.7"
+	Version   string = "0.1.8"
 	BuildDate string
 	GoVersion string
 	Stream    string // e.g., "prod", "dev", "beta"
@@ -1965,7 +1965,7 @@ func init() {
 		BuildDate = "unknown" // Override at build time with -ldflags
 	}
 	if Stream == "" {
-		Stream = "dev" // Default; override via build or config
+		Stream = "beta" // Default; override via build or config
 	}
 }
 
