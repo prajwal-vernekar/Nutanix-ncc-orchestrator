@@ -1,6 +1,6 @@
 # Nutanix NCC Orchestrator + Prometheus Monitoring
 
-monitoring for Nutanix clusters using NCC Orchestrator → node_exporter textfile collector → Prometheus → Grafana)
+monitoring for Nutanix clusters using NCC Orchestrator → node_exporter textfile collector → Prometheus → Grafana
 ​
 
 ## Architecture

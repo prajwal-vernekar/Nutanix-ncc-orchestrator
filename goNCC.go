@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,6 +67,33 @@ type Config struct {
 
 	// Prometheus metrics
 	PromDir string `mapstructure:"prom-dir"`
+
+	// Email
+	EmailEnabled bool
+	SMTPServer   string
+	SMTPPort     int
+	SMTPUser     string
+	SMTPPassword string
+	EmailFrom    string
+	EmailTo      []string
+	EmailUseTLS  bool
+
+	// Webhook
+	WebhookEnabled bool
+	WebhookURL     string
+	WebhookHeaders map[string]string `mapstructure:"webhook-headers"`
+}
+
+type NotificationSummary struct {
+	Cluster     string
+	StartedAt   time.Time
+	FinishedAt  time.Time
+	FailCount   int
+	WarnCount   int
+	ErrCount    int
+	InfoCount   int
+	TotalChecks int
+	OutputFiles []string // paths to HTML/CSV generated
 }
 
 const termsText = `
@@ -187,6 +215,22 @@ retry-max-attempts: 6                     # Max attempts per request
 retry-base-delay: "400ms"                 # Base backoff delay  
 retry-max-delay: "8s"                     # Max jittered backoff delay  
 
+# Email notifications
+email-enabled: false
+smtp-server: "smtp.example.com"
+smtp-port: 587
+smtp-user: "ncc@example.com"
+smtp-password: ""
+email-from: "ncc@example.com"
+email-to: "ops@example.com,sre@example.com"
+email-use-tls: true
+
+# Webhook notifications
+webhook-enabled: false
+webhook-url: "https://hooks.example.com/ncc"
+webhook-headers:
+  X-Auth-Token: "changeme"
+
 `
 	case ".json":
 		dummy = `{
@@ -240,6 +284,22 @@ log-http: false                           # Set true only for debugging; logs re
 retry-max-attempts: 6                     # Max attempts per request  
 retry-base-delay: "400ms"                 # Base backoff delay  
 retry-max-delay: "8s"                     # Max jittered backoff delay  
+
+# Email notifications
+email-enabled: false
+smtp-server: "smtp.example.com"
+smtp-port: 587
+smtp-user: "ncc@example.com"
+smtp-password: ""
+email-from: "ncc@example.com"
+email-to: "ops@example.com,sre@example.com"
+email-use-tls: true
+
+# Webhook notifications
+webhook-enabled: false
+webhook-url: "https://hooks.example.com/ncc"
+webhook-headers:
+  X-Auth-Token: "changeme"
 `
 	}
 	dir := filepath.Dir(path)
@@ -325,6 +385,17 @@ func bindConfig() (Config, error) {
 		RetryMaxAttempts:   viper.GetInt("retry-max-attempts"),
 		RetryBaseDelay:     mustParseDur(viper.GetString("retry-base-delay"), 400*time.Millisecond),
 		RetryMaxDelay:      mustParseDur(viper.GetString("retry-max-delay"), 8*time.Second),
+		EmailEnabled:       viper.GetBool("email-enabled"),
+		SMTPServer:         viper.GetString("smtp-server"),
+		SMTPPort:           viper.GetInt("smtp-port"),
+		SMTPUser:           viper.GetString("smtp-user"),
+		SMTPPassword:       viper.GetString("smtp-password"),
+		EmailFrom:          viper.GetString("email-from"),
+		EmailTo:            splitCSV(viper.GetString("email-to")),
+		EmailUseTLS:        viper.GetBool("email-use-tls"),
+		WebhookEnabled:     viper.GetBool("webhook-enabled"),
+		WebhookURL:         viper.GetString("webhook-url"),
+		WebhookHeaders:     viper.GetStringMapString("webhook-headers"),
 	}
 	if cfg.OutputDirLogs == "" {
 		cfg.OutputDirLogs = "nccfiles"
@@ -698,6 +769,107 @@ func ParseSummary(text string) ([]ParsedBlock, error) {
 		}
 	}
 	return blocks, nil
+}
+
+/************** Email-Notify **************/
+
+func sendEmail(cfg Config, subj string, body string) error {
+	if !cfg.EmailEnabled || cfg.SMTPServer == "" || len(cfg.EmailTo) == 0 {
+		return nil
+	}
+
+	addr := fmt.Sprintf("%s:%d", cfg.SMTPServer, cfg.SMTPPort)
+	auth := smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPServer)
+
+	msg := bytes.Buffer{}
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", cfg.EmailFrom))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(cfg.EmailTo, ",")))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subj))
+	msg.WriteString("MIME-Version: 1.0\r\n")
+	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	msg.WriteString("\r\n")
+	msg.WriteString(body)
+
+	if cfg.EmailUseTLS {
+		// STARTTLS-style connection:
+		c, err := smtp.Dial(addr)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+
+		if err := c.StartTLS(&tls.Config{ServerName: cfg.SMTPServer, InsecureSkipVerify: cfg.InsecureSkipVerify}); err != nil {
+			return err
+		}
+		if err := c.Auth(auth); err != nil {
+			return err
+		}
+		if err := c.Mail(cfg.EmailFrom); err != nil {
+			return err
+		}
+		for _, rcpt := range cfg.EmailTo {
+			if err := c.Rcpt(rcpt); err != nil {
+				return err
+			}
+		}
+		w, err := c.Data()
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(msg.Bytes()); err != nil {
+			return err
+		}
+		return w.Close()
+	}
+
+	return smtp.SendMail(addr, auth, cfg.EmailFrom, cfg.EmailTo, msg.Bytes())
+}
+
+/************** Webhook-Notify **************/
+
+func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary NotificationSummary) error {
+	if !cfg.WebhookEnabled || cfg.WebhookURL == "" {
+		return nil
+	}
+
+	payload, err := json.Marshal(summary)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.WebhookURL, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range cfg.WebhookHeaders {
+		req.Header.Set(k, v)
+	}
+
+	// simple retry loop using existing helpers
+	for attempt := 1; attempt <= cfg.RetryMaxAttempts; attempt++ {
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == cfg.RetryMaxAttempts {
+				return err
+			}
+		} else {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			if !isRetryableStatus(resp.StatusCode) || attempt == cfg.RetryMaxAttempts {
+				return fmt.Errorf("webhook status %d", resp.StatusCode)
+			}
+			if d, ok := retryAfterDelay(resp); ok {
+				time.Sleep(d)
+				continue
+			}
+		}
+		time.Sleep(jitteredBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, attempt))
+	}
+	return nil
 }
 
 /************** Renderers **************/
@@ -1786,7 +1958,7 @@ func runClusterWithBars(
 ) ([]ParsedBlock, error) {
 	l := log.With().Str("cluster", cluster).Logger()
 	client := NewNCCClient(cluster, cfg.Username, cfg.Password, httpc, cfg)
-
+	var clusterStart = time.Now()
 	setPhase("starting")
 	l.Info().Msg("starting NCC checks")
 	taskID, body, err := client.StartChecks(ctx)
@@ -1873,6 +2045,39 @@ SUMMARY:
 		l.Error().Err(err).Msg("parse filtered failed")
 		return nil, err
 	}
+	counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
+	for _, b := range blocks {
+		sev := b.Severity
+		if sev == "" {
+			sev = "INFO"
+		}
+		counts[sev]++
+	}
+	summaryNotify := NotificationSummary{
+		Cluster:     cluster,
+		StartedAt:   clusterStart,
+		FinishedAt:  time.Now(),
+		FailCount:   counts["FAIL"],
+		WarnCount:   counts["WARN"],
+		ErrCount:    counts["ERR"],
+		InfoCount:   counts["INFO"],
+		TotalChecks: len(blocks),
+		OutputFiles: []string{filteredPath},
+	}
+
+	subj := fmt.Sprintf("NCC %s: FAIL=%d WARN=%d", summaryNotify.Cluster,
+		summaryNotify.FailCount, summaryNotify.WarnCount)
+	bodyEmail := fmt.Sprintf("FAIL: %d | WARN: %d | Total: %d\nFiltered: %s",
+		summaryNotify.FailCount, summaryNotify.WarnCount, len(blocks), filteredPath)
+
+	if err := sendEmail(cfg, subj, bodyEmail); err != nil {
+		l.Error().Err(err).Msg("email failed")
+	}
+	if err := sendWebhook(ctx, httpc, cfg, summaryNotify); err != nil {
+		l.Error().Err(err).Msg("webhook failed")
+	}
+	l.Info().Int("fail", summaryNotify.FailCount).Int("warn", summaryNotify.WarnCount).Msg("notifications sent")
+
 	if len(blocks) == 0 {
 		l.Warn().Str("path", filteredPath).Msg("no blocks parsed from summary")
 	}
@@ -1937,7 +2142,7 @@ func promptPasswordIfEmpty(p string, Username string) (string, error) {
 }
 
 var (
-	Version   string = "0.1.8"
+	Version   string = "0.1.9"
 	BuildDate string
 	GoVersion string
 	Stream    string // e.g., "prod", "dev", "beta"
@@ -1965,7 +2170,7 @@ func init() {
 		BuildDate = "unknown" // Override at build time with -ldflags
 	}
 	if Stream == "" {
-		Stream = "beta" // Default; override via build or config
+		Stream = "Alpha" // Default; override via build or config
 	}
 }
 
@@ -2121,6 +2326,44 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						log.Error().Str("cluster", cluster).Err(err).Msg("replay: parse filtered failed")
 						continue
 					}
+
+					counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
+					for _, b := range blocks {
+						sev := b.Severity
+						if sev == "" {
+							sev = "INFO"
+						}
+						counts[sev]++
+					}
+					replaySummary := NotificationSummary{
+						Cluster:     cluster,                           // from replay filename or param
+						StartedAt:   time.Now().Add(-10 * time.Minute), // estimate
+						FinishedAt:  time.Now(),
+						FailCount:   counts["FAIL"],
+						WarnCount:   counts["WARN"],
+						ErrCount:    counts["ERR"],
+						InfoCount:   counts["INFO"],
+						TotalChecks: len(blocks),
+						OutputFiles: []string{filtered},
+					}
+
+					subj := fmt.Sprintf("NCC REPLAY %s: FAIL=%d WARN=%d",
+						replaySummary.Cluster, replaySummary.FailCount, replaySummary.WarnCount)
+					body := fmt.Sprintf("REPLAY MODE - From existing log:\nFAIL: %d | WARN: %d | Total: %d\nLog: %s",
+						replaySummary.FailCount, replaySummary.WarnCount, len(blocks), filtered)
+
+					ctx := context.Background()
+					httpc := NewHTTPClient(cfg)
+
+					if err := sendEmail(cfg, subj, body); err != nil {
+						log.Error().Err(err).Str("cluster", cluster).Msg("replay email failed")
+					}
+					if err := sendWebhook(ctx, httpc, cfg, replaySummary); err != nil {
+						log.Error().Err(err).Str("cluster", cluster).Msg("replay webhook failed")
+					}
+					log.Info().Int("fail", replaySummary.FailCount).Int("warn", replaySummary.WarnCount).
+						Str("cluster", cluster).Msg("replay notifications sent")
+
 					// Per-cluster outputs
 					base := filtered
 					for _, f := range cfg.OutputFormats {
@@ -2319,6 +2562,17 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().String("retry-max-delay", "8s", "Max retry delay cap")
 	cmd.Flags().Bool("replay", false, "Replay from existing logs without running NCC")
 	cmd.Flags().String("prom-dir", "promfiles", "Directory for Prometheus metrics")
+	cmd.Flags().Bool("email-enabled", false, "Enable email notifications")
+	cmd.Flags().String("smtp-server", "", "SMTP server (smtp.gmail.com)")
+	cmd.Flags().String("smtp-port", "587", "SMTP port (587=STARTTLS, 465=SSL)")
+	cmd.Flags().String("smtp-user", "", "SMTP username")
+	cmd.Flags().String("smtp-password", "", "SMTP password (use env NCC_SMTP_PASSWORD)")
+	cmd.Flags().String("email-from", "", "From email address")
+	cmd.Flags().String("email-to", "", "Comma-separated recipient emails")
+	cmd.Flags().Bool("email-use-tls", true, "Use STARTTLS (recommended)")
+	cmd.Flags().Bool("webhook-enabled", false, "Enable webhook notifications")
+	cmd.Flags().String("webhook-url", "", "Webhook endpoint URL")
+	cmd.Flags().StringToString("webhook-headers", map[string]string{}, "Webhook headers (key=value)")
 
 	// viper bindings
 	_ = viper.BindPFlag("config", cmd.Flags().Lookup("config"))
@@ -2342,6 +2596,17 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	_ = viper.BindPFlag("retry-max-delay", cmd.Flags().Lookup("retry-max-delay"))
 	_ = viper.BindPFlag("replay", cmd.Flags().Lookup("replay"))
 	_ = viper.BindPFlag("prom-dir", cmd.Flags().Lookup("prom-dir"))
+	_ = viper.BindPFlag("email-enabled", cmd.Flags().Lookup("email-enabled"))
+	_ = viper.BindPFlag("smtp-server", cmd.Flags().Lookup("smtp-server"))
+	_ = viper.BindPFlag("smtp-port", cmd.Flags().Lookup("smtp-port"))
+	_ = viper.BindPFlag("smtp-user", cmd.Flags().Lookup("smtp-user"))
+	_ = viper.BindPFlag("smtp-password", cmd.Flags().Lookup("smtp-password"))
+	_ = viper.BindPFlag("email-from", cmd.Flags().Lookup("email-from"))
+	_ = viper.BindPFlag("email-to", cmd.Flags().Lookup("email-to"))
+	_ = viper.BindPFlag("email-use-tls", cmd.Flags().Lookup("email-use-tls"))
+	_ = viper.BindPFlag("webhook-enabled", cmd.Flags().Lookup("webhook-enabled"))
+	_ = viper.BindPFlag("webhook-url", cmd.Flags().Lookup("webhook-url"))
+	_ = viper.BindPFlag("webhook-headers", cmd.Flags().Lookup("webhook-headers"))
 
 	return cmd
 }
