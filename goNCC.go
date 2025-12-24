@@ -142,6 +142,22 @@ retry-max-attempts: 6                     # Max attempts per request
 retry-base-delay: "400ms"                 # Base backoff delay  
 retry-max-delay: "8s"                     # Max jittered backoff delay  
 
+# Email notifications
+email-enabled: false
+smtp-server: "smtp.example.com"
+smtp-port: 587
+smtp-user: "ncc@example.com"
+smtp-password: ""
+email-from: "ncc@example.com"
+email-to: "ops@example.com,sre@example.com"
+email-use-tls: true
+
+# Webhook notifications
+webhook-enabled: false
+webhook-url: "https://hooks.example.com/ncc"
+webhook-headers:
+  X-Auth-Token: "changeme"
+
 Use --config to specify file path.
 
 Nutanix APIs used:
