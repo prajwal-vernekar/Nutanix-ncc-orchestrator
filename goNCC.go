@@ -2279,6 +2279,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 					"RETRY_MAX_ATTEMPTS",
 					"RETRY_BASE_DELAY",
 					"RETRY_MAX_DELAY",
+					"SMTP_PASSWORD",
 				}
 				for _, key := range envKeys {
 					envVar := "NCC_" + key
