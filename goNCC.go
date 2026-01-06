@@ -96,6 +96,18 @@ type NotificationSummary struct {
 	OutputFiles []string // paths to HTML/CSV generated
 }
 
+type HTMLMeta struct {
+	ClusterName    string
+	ClusterVersion string
+	NCCVersion     string
+}
+
+type HTMLData struct {
+	Rows []Row
+	Now  string
+	Meta HTMLMeta
+}
+
 const termsText = `
 This script is created by Prajwal Vernekar (prajwal.vernekar@nutanix.com).
 
@@ -787,6 +799,32 @@ func ParseSummary(text string) ([]ParsedBlock, error) {
 	return blocks, nil
 }
 
+func parseNCCHeader(path string) (HTMLMeta, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return HTMLMeta{}, err
+	}
+
+	var meta HTMLMeta
+	scanner := bufio.NewScanner(bytes.NewReader(b))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		switch {
+		case strings.HasPrefix(line, "Cluster Name:"):
+			meta.ClusterName = strings.TrimSpace(strings.TrimPrefix(line, "Cluster Name:"))
+		case strings.HasPrefix(line, "Cluster Version:"):
+			meta.ClusterVersion = strings.TrimSpace(strings.TrimPrefix(line, "Cluster Version:"))
+		case strings.HasPrefix(line, "NCC Version:"):
+			meta.NCCVersion = strings.TrimSpace(strings.TrimPrefix(line, "NCC Version:"))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return HTMLMeta{}, err
+	}
+	return meta, nil
+}
+
 /************** Email-Notify **************/
 
 func sendEmail(cfg Config, subj string, body string) error {
@@ -932,12 +970,16 @@ func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary Not
 // 	return t.Execute(f, rows)
 // }
 
-func generateHTML(fs FS, rows []Row, filename string) error {
+func generateHTMLNoMeta(fs FS, rows []Row, filename string) error {
+	return generateHTML(fs, rows, filename, HTMLMeta{})
+}
+
+func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
 	const tmpl = `
 <html>
 <head>
   <meta charset="utf-8">
-  <title>NCC Report</title>
+  <title>NCC Report - {{.Meta.ClusterName}}</title>
   <style>
     :root {
       --fail: #ef4444;
@@ -965,42 +1007,122 @@ func generateHTML(fs FS, rows []Row, filename string) error {
     .sev.INFO { color: #fff; background: var(--info); }
     .sev.ERR  { color: #111827; background: #e5e7eb; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+
+	body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  color: #111827;
+  background: #f9fafb;
+}
+.page {
+  max-width: 1100px;
+  margin: 24px auto;
+  padding: 0 16px 24px;
+}
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+h1 {
+  margin: 0;
+  font-size: 22px;
+}
+.subtitle {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #6b7280;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.tag {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  display: inline-flex;
+  gap: 4px;
+}
+.tag .label {
+  color: #6b7280;
+}
+.tag .value {
+  font-weight: 600;
+  color: #111827;
+}
+
+/* keep your existing table / sev / mono styles */
+
   </style>
 </head>
 <body>
-  <h1>NCC Report</h1>
-  <div class="meta">Generated at {{.Now}}</div>
-  <table>
-    <thead>
-      <tr>
-        <th style="width:120px">Severity</th>
-        <th style="width:360px">NCC Check Name</th>
-        <th>Detail Information</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{range .Rows}}
-      <tr>
-        <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
-        <td class="mono">{{.CheckName}}</td>
-        <td class="mono">{{.Detail}}</td>
-      </tr>
-      {{end}}
-    </tbody>
-  </table>
+  <div class="page">
+    <header class="header">
+      <div>
+        <h1>NCC Report</h1>
+        <div class="subtitle">{{.Meta.ClusterName}}</div>
+      </div>
+      <div class="tags">
+        <div class="tag">
+          <span class="label">Cluster</span>
+          <span class="value">{{.Meta.ClusterName}}</span>
+        </div>
+        <div class="tag">
+          <span class="label">Cluster Version</span>
+          <span class="value">{{.Meta.ClusterVersion}}</span>
+        </div>
+        <div class="tag">
+          <span class="label">NCC Version</span>
+          <span class="value">{{.Meta.NCCVersion}}</span>
+        </div>
+        <div class="tag">
+          <span class="label">Generated</span>
+          <span class="value">{{.Now}}</span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <table>
+        <thead>
+        <tr>
+          <th style="width:110px">Severity</th>
+          <th style="width:320px">NCC Check Name</th>
+          <th>Detail Information</th>
+        </tr>
+        </thead>
+        <tbody>
+        {{range .Rows}}
+        <tr>
+          <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
+          <td class="mono">{{.CheckName}}</td>
+          <td class="mono">{{.Detail}}</td>
+        </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </main>
+  </div>
 </body>
+
 </html>`
 	f, err := fs.Create(filename)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	data := struct {
-		Rows []Row
-		Now  string
-	}{
+
+	data := HTMLData{
 		Rows: rows,
 		Now:  time.Now().Format(time.RFC3339),
+		Meta: meta,
 	}
 	t := template.Must(template.New("table").Parse(tmpl))
 	return t.Execute(f, data)
@@ -1041,10 +1163,13 @@ func rowsFromBlocks(blocks []ParsedBlock) []Row {
 /************** Aggregation **************/
 
 type AggBlock struct {
-	Cluster  string
-	Severity string
-	Check    string
-	Detail   string
+	Cluster        string
+	Severity       string
+	Check          string
+	Detail         string
+	ClusterName    string
+	ClusterVersion string
+	NCCVersion     string
 }
 
 func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster []struct{ Cluster, HTML, CSV string }) error {
@@ -1138,6 +1263,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	.highlight { background: #3b82f655; }
 	
 	/* Column sizing */
+	th.col-cname, td.col-cname { width: 190px; }
 	th.col-cluster, td.col-cluster   { width: 140px; }
 	th.col-sev,     td.col-sev       { width: 96px; }
 	th.col-title,   td.col-title     { width: 240px; }
@@ -1231,6 +1357,12 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   outline: 2px solid var(--accent);
 }
 
+.cluster-meta {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
 	</style>
 	<script>
 	// Embedded data
@@ -1238,7 +1370,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	
 	// State
 	let state = {
-	  sortKey: "Cluster",
+	  sortKey: "severity",
 	  sortDir: "asc",
 	  filterSev: new Set(["FAIL","WARN","ERR","INFO"]),
 	  filterClusters: new Set(),
@@ -1255,7 +1387,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	}
 	
 	function buildClusterFilter() {
-	  const clusters = Array.from(new Set(AGG.map(r => r.Cluster))).sort();
+	  const clusters = Array.from(new Set(AGG.map(r => r.cluster))).sort();
 	  const sel = document.getElementById("clusterSel");
 	  sel.innerHTML = "";
 	  clusters.forEach(c => {
@@ -1302,10 +1434,10 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	function filterData() {
 	  const needle = state.search.toLowerCase();
 	  return AGG.filter(r => {
-		if (!state.filterSev.has(r.Severity)) return false;
-		if (!state.filterClusters.has(r.Cluster)) return false;
+		if (!state.filterSev.has(r.severity)) return false;
+		if (!state.filterClusters.has(r.cluster)) return false;
 		if (!needle) return true;
-		const hay = (r.Cluster + " " + r.Severity + " " + r.Check + " " + r.Detail).toLowerCase();
+		const hay = (r.cluster + " " + r.severity + " " + r.check + " " + r.detail).toLowerCase();
 		return hay.includes(needle);
 	  });
 	}
@@ -1315,7 +1447,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  const mul = dir === "asc" ? 1 : -1;
 	  rows.sort((a,b) => {
 		let av = a[k], bv = b[k];
-		if (k === "Severity") { av = sevRank[av] || 99; bv = sevRank[bv] || 99; }
+		if (k === "severity") { av = sevRank[av] || 99; bv = sevRank[bv] || 99; }
 		return (av > bv ? 1 : av < bv ? -1 : 0) * mul;
 	  });
 	  return rows;
@@ -1324,7 +1456,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	function updateCounts(rows) {
 	  const total = rows.length;
 	  const cnt = { FAIL:0, WARN:0, ERR:0, INFO:0 };
-	  rows.forEach(r => { if (cnt[r.Severity] !== undefined) cnt[r.Severity]++; });
+	  rows.forEach(r => { if (cnt[r.severity] !== undefined) cnt[r.severity]++; });
 	
 	  document.getElementById("countTotal").textContent = total;
 	  document.getElementById("countFail").textContent = cnt.FAIL;
@@ -1344,8 +1476,8 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  pc.innerHTML = "";
 	  const map = {};
 	  rows.forEach(r => {
-		map[r.Cluster] = map[r.Cluster] || { FAIL:0,WARN:0,ERR:0,INFO:0, total:0 };
-		map[r.Cluster][r.Severity]++; map[r.Cluster].total++;
+		map[r.cluster] = map[r.cluster] || { FAIL:0,WARN:0,ERR:0,INFO:0, total:0 };
+		map[r.cluster][r.severity]++; map[r.cluster].total++;
 	  });
 	  const table = document.createElement("table");
 	  table.innerHTML = '<thead><tr><th>Cluster</th><th>FAIL</th><th>WARN</th><th>ERR</th><th>INFO</th><th>Total</th></tr></thead><tbody></tbody>';
@@ -1421,21 +1553,39 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 		tr.setAttribute("tabindex", "0");
 		tr.dataset.index = idx.toString();
 	
-		const detailEsc = (r.Detail || "").replaceAll("\\n","<br>");
+		const detailEsc = (r.detail || "").replaceAll("\\n","<br>");
+		const nameLine = escapeHtml(r.clusterName || "-");
+		const verLine  = escapeHtml(r.clusterVersion || "");
+		const nccLine  = escapeHtml(r.nccVersion || "");
 	
-		const kb = extractKB(r.Detail);
+		const kb = extractKB(r.detail);
 		const kbCell = kb ? ('<a href="' + kb + '" target="_blank" rel="noopener">' + kbLabel(kb) + '</a>') : '';
-		const clusterUrl = 'https://' + encodeURIComponent(r.Cluster) + ':9440';
-		const rowText = (r.Cluster + " " + r.Severity + " " + r.Check + " " + (r.Detail || "")).trim();
+		const clusterUrl = 'https://' + encodeURIComponent(r.cluster) + ':9440';
+		const rowText = (r.cluster + " " + r.severity + " " + r.check + " " + (r.detail || "")).trim();
 		const actHTML =
 		  '<div class="actions">' +
 		  '<button onclick="copyText(\'' + jsEscape(rowText) + '\')">Copy row</button>' +
-		  '<button onclick="copyText(\'' + jsEscape(r.Detail || "") + '\')">Copy detail</button>' +
+		  '<button onclick="copyText(\'' + jsEscape(r.detail || "") + '\')">Copy detail</button>' +
 		  '</div>';
-		const checkTitle = formatCheckTitle(r.Check || "");
+		const nameCell =
+		  '<td class="col-cname">' +
+		    '<div class="mono" style="color: var(--text); font-weight: 600;">' + highlight(nameLine, needle) + '</div>' +
+		    '<div class="cluster-meta mono">' +
+		      (verLine ? ('<div>Version: ' + highlight(verLine, needle) + '</div>') : '') +
+		      (nccLine ? ('<div>NCC: ' + highlight(nccLine, needle) + '</div>') : '') +
+		    '</div>' +
+		  '</td>';
+		const clusterCell =
+		  '<td class="col-cluster"><small class="mono">' +
+		    '<a href="' + clusterUrl + '" target="_blank" rel="noopener">' +
+		      highlight(r.cluster, needle) +
+		    '</a>' +
+		  '</small></td>';
+		const checkTitle = formatCheckTitle(r.check || "");
 		tr.innerHTML =
-		  '<td class="col-cluster"><small class="mono"><a href="' + clusterUrl + '" target="_blank" rel="noopener">' + highlight(r.Cluster, needle) + '</a></small></td>' +
-		  '<td class="col-sev"><span class="severity sev-' + r.Severity + '">' + r.Severity + '</span></td>' +
+		  nameCell +
+		  clusterCell +
+		  '<td class="col-sev"><span class="severity sev-' + r.severity + '">' + r.severity + '</span></td>' +
 		  '<td class="col-title"><small class="mono">' + highlight(checkTitle, needle) + '</small></td>' +
 		  '<td class="col-kb">' + kbCell + '</td>' +
 		  '<td class="col-detail"><div class="detail-full">' + highlight(detailEsc, needle) + '</div></td>' +
@@ -1490,7 +1640,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  // Update visible counters
 	  const total = rows.length;
 	  const cnt = { FAIL:0, WARN:0, ERR:0, INFO:0 };
-	  rows.forEach(r => { if (cnt[r.Severity] !== undefined) cnt[r.Severity]++; });
+	  rows.forEach(r => { if (cnt[r.severity] !== undefined) cnt[r.severity]++; });
 	  document.getElementById("countTotal").textContent = total;
 	  document.getElementById("countFail").textContent = cnt.FAIL;
 	  document.getElementById("countWarn").textContent = cnt.WARN;
@@ -1514,8 +1664,8 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 		const headers = ["Cluster","Severity","NCC Alert Title","Detail"];
 		const lines = [headers.join(",")];
 		rows.forEach(r => {
-		  const title = formatCheckTitle(r.Check || "");
-		  const row = [r.Cluster, r.Severity, title, r.Detail || ""].map(v => {
+		  const title = formatCheckTitle(r.check || "");
+		  const row = [r.cluster, r.severity, title, r.detail || ""].map(v => {
 		    const s = (v ?? "").toString().replaceAll('"','""').replaceAll("\r"," ").replaceAll("\n","\\n");
 		    return '"' + s + '"';
 		  }).join(",");
@@ -1629,9 +1779,10 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 		  <table>
 			<thead>
 			  <tr>
-				<th class="col-cluster" onclick="sortBy('Cluster')">Cluster</th>
-				<th class="col-sev" onclick="sortBy('Severity')">Severity</th>
-				<th class="col-title" onclick="sortBy('Check')">NCC Alert Title</th>
+			  	<th class="col-cname" onclick="sortBy('clusterName')">Cluster Name</th>
+				<th class="col-cluster" onclick="sortBy('cluster')">Cluster</th>
+				<th class="col-sev" onclick="sortBy('severity')">Severity</th>
+				<th class="col-title" onclick="sortBy('check')">NCC Alert Title</th>
 				<th class="col-kb">KB</th>
 				<th class="col-detail">Detail</th>
 				<th class="col-actions">Actions</th>
@@ -1664,26 +1815,42 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 
 	// Build data for template with embedded JSON
 	type tmplRow struct {
-		Cluster  string
-		Severity string
-		Check    string
-		Detail   string
+		Cluster        string `json:"cluster"`
+		Severity       string `json:"severity"`
+		Check          string `json:"check"`
+		Detail         string `json:"detail"`
+		ClusterName    string `json:"clusterName"`
+		ClusterVersion string `json:"clusterVersion"`
+		NCCVersion     string `json:"nccVersion"`
 	}
+
 	aggRows := make([]tmplRow, 0, len(rows))
 	for _, r := range rows {
-		aggRows = append(aggRows, tmplRow(r))
+		aggRows = append(aggRows, tmplRow{
+			Cluster:        r.Cluster,
+			Severity:       r.Severity,
+			Check:          r.Check,
+			Detail:         r.Detail,
+			ClusterName:    r.ClusterName,
+			ClusterVersion: r.ClusterVersion,
+			NCCVersion:     r.NCCVersion,
+		})
 	}
-	// Embed JSON safely
+
 	jsonBytes, err := json.Marshal(aggRows)
 	if err != nil {
 		return fmt.Errorf("marshal agg json: %w", err)
 	}
+
 	data := struct {
-		JSON        template.JS
-		Clusters    []struct{ Cluster, HTML, CSV string }
-		GeneratedAt string
+		JSON           template.JS
+		Clusters       []struct{ Cluster, HTML, CSV string }
+		GeneratedAt    string
+		ClusterName    string
+		ClusterVersion string
+		NCCVersion     string
 	}{
-		JSON:        template.JS(jsonBytes), // trusted program output
+		JSON:        template.JS(jsonBytes),
 		Clusters:    perCluster,
 		GeneratedAt: time.Now().Format(time.RFC3339),
 	}
@@ -2104,7 +2271,10 @@ SUMMARY:
 		switch strings.ToLower(strings.TrimSpace(f)) {
 		case "html":
 			htmlFile := base + ".html"
-			if err := generateHTML(fs, rowsFromBlocks(blocks), htmlFile); err != nil {
+			rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+			meta, _ := parseNCCHeader(rawPath) // ignore error if file missing
+			rows := rowsFromBlocks(blocks)
+			if err := generateHTML(fs, rows, htmlFile, meta); err != nil {
 				l.Error().Err(err).Str("file", htmlFile).Msg("write HTML failed")
 				return nil, err
 			}
@@ -2158,7 +2328,7 @@ func promptPasswordIfEmpty(p string, Username string) (string, error) {
 }
 
 var (
-	Version   string = "0.1.9"
+	Version   string = "0.1.10"
 	BuildDate string
 	GoVersion string
 	Stream    string // e.g., "prod", "dev", "beta"
@@ -2387,7 +2557,22 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						_ = writePrometheusFile(fs, cfg.PromDir, cluster, blocks)
 						switch strings.ToLower(strings.TrimSpace(f)) {
 						case "html":
-							_ = generateHTML(OSFS{}, rowsFromBlocks(blocks), base+".html")
+							htmlFile := base + ".html"
+
+							// raw NCC log for this cluster, reused in replay
+							rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+
+							meta, err := parseNCCHeader(rawPath)
+							if err != nil {
+								// fall back to no meta if header log not present in older runs
+								log.Warn().Err(err).Str("rawPath", rawPath).Msg("replay: parseNCCHeader failed, using empty meta")
+								meta = HTMLMeta{}
+							}
+
+							// 4‑arg version that uses meta in template
+							if err := generateHTML(OSFS{}, rowsFromBlocks(blocks), htmlFile, meta); err != nil {
+								log.Error().Err(err).Str("file", htmlFile).Msg("replay: write HTML failed")
+							}
 						case "csv":
 							_ = generateCSV(OSFS{}, blocks, base+".csv")
 						}
@@ -2402,12 +2587,18 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						HTML:    filepath.Base(base + ".html"),
 						CSV:     filepath.Base(base + ".csv"),
 					})
+					rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+					meta, _ := parseNCCHeader(rawPath) // ignore error
+
 					for _, b := range blocks {
 						agg = append(agg, AggBlock{
-							Cluster:  cluster,
-							Severity: b.Severity,
-							Check:    b.CheckName,
-							Detail:   b.DetailRaw,
+							Cluster:        cluster,
+							Severity:       b.Severity,
+							Check:          b.CheckName,
+							Detail:         b.DetailRaw,
+							ClusterName:    meta.ClusterName,
+							ClusterVersion: meta.ClusterVersion,
+							NCCVersion:     meta.NCCVersion,
 						})
 					}
 				}
@@ -2514,12 +2705,19 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 					failed = append(failed, r.Cluster)
 					continue
 				}
+
+				rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", r.Cluster))
+				meta, _ := parseNCCHeader(rawPath) // ignore error
+
 				for _, b := range r.Blocks {
 					agg = append(agg, AggBlock{
-						Cluster:  r.Cluster,
-						Severity: b.Severity,
-						Check:    b.CheckName,
-						Detail:   b.DetailRaw,
+						Cluster:        r.Cluster,
+						Severity:       b.Severity,
+						Check:          b.CheckName,
+						Detail:         b.DetailRaw,
+						ClusterName:    meta.ClusterName,
+						ClusterVersion: meta.ClusterVersion,
+						NCCVersion:     meta.NCCVersion,
 					})
 				}
 				basePath := filepath.Join(cfg.OutputDirFiltered, fmt.Sprintf("%s.log", r.Cluster))
