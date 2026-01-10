@@ -1140,6 +1140,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	<html>
 	<head>
 	<meta charset="utf-8">
+  	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>NCC Aggregated Report</title>
 	<style>
 	:root {
@@ -1164,8 +1165,9 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
 	  background: linear-gradient(180deg,#0b1224,#0e1630);
 	  color: var(--text);
+    background-color: var(--row1);
 	}
-	.container { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
+	.container { max-width: 1400px; margin: 0 auto; padding: 7px 12px; }
 	.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 	.title h1 { margin: 0; font-size: 22px; font-weight: 700; }
 	.title .sub { color: var(--muted); font-size: 12px; }
@@ -1180,7 +1182,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	.dot.fail{ background: var(--fail); } .dot.warn{ background: var(--warn); }
 	.dot.info{ background: var(--info); } .dot.err{ background: var(--err); }
 	.legend { display:flex; gap:8px; flex-wrap: wrap; }
-	.card { background: #0d152b; border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+	.card { padding: 12px; }
 	
 	 
 	.summary { display:grid; grid-template-columns: repeat(5, 1fr); gap:12px; margin: 16px 0; }
@@ -1192,8 +1194,24 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	.progress.fail > span { background: var(--fail); } .progress.warn > span { background: var(--warn); }
 	.progress.err  > span { background: var(--err); }  .progress.info > span { background: var(--info); }
 	
-	 
-	.scroll { overflow-x: auto; overflow-y: hidden; }
+.scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch; /* smooth mobile scroll */
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  margin: 0 -12px 16px -12px; /* full width minus padding */
+  padding: 12px;
+}
+
+@media (max-width: 1024px) {
+  .scroll {
+    margin: 0 -8px 16px -8px;
+    padding: 8px;
+  }
+}
+
+
 	.scroll::-webkit-scrollbar { height: 10px; }
 	.scroll::-webkit-scrollbar-thumb { background: #22304d; border-radius: 8px; }
 	.scroll::-webkit-scrollbar-track { background: #0a1123; }
@@ -1629,6 +1647,90 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   color: #bfdbfe !important;
 }
 
+
+@media (max-width: 768px) {
+  .controls {
+    flex-direction: column !important;
+    gap: 8px;
+    align-items: stretch;
+  }
+  
+  .control {
+    flex: 1;
+    min-width: 0; /* allow shrinking */
+  }
+  
+  .control input[type="text"] {
+    width: 100%;
+    font-size: 16px; /* mobile zoom fix */
+  }
+}
+
+@media (max-width: 900px) {
+  th.col-kb, td.col-kb,
+  th.col-actions, td.col-actions {
+    display: none; /* Hide KB/Actions on small screens */
+  }
+  
+  th.col-detail, td.col-detail {
+    min-width: 200px; /* Priority for details */
+  }
+}
+
+@media (max-width: 600px) {
+  th.col-cluster, td.col-cluster {
+    display: none; /* Hide IP on tiny screens */
+  }
+  
+  th.col-cname, td.col-cname {
+    width: 140px !important; /* Fixed width for cluster names */
+  }
+}
+
+/* 6. PRINT STYLES (clean PDF export) */
+@media print {
+  .controls, .actions, .summary, footer {
+    display: none !important;
+  }
+  
+  .scroll {
+    overflow: visible !important;
+    border: none !important;
+    margin: 0 !important;
+  }
+  
+  table {
+    font-size: 9px !important;
+    width: 100% !important;
+  }
+  
+  th, td {
+    padding: 4px 2px !important;
+    border-bottom: 1px solid #ccc !important;
+  }
+}
+
+/* 7. MOBILE SUMMARY CARDS (stack vertically) */
+@media (max-width: 768px) {
+  .summary {
+    grid-template-columns: 1fr !important;
+    gap: 8px;
+    margin: 12px 0;
+  }
+}
+
+/* 8. TOUCH TARGETS (min 44px for mobile) */
+button, .cluster-display, .cluster-toggle {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .actions button {
+    padding: 12px 16px; /* bigger touch targets */
+    font-size: 14px;
+  }
+}
 
 	</style>
 	<script>
