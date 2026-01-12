@@ -1142,6 +1142,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	<meta charset="utf-8">
   	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>NCC Aggregated Report</title>
+	  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
 	<style>
 	:root {
 	  --bg: #0f172a;
