@@ -96,6 +96,18 @@ type NotificationSummary struct {
 	OutputFiles []string // paths to HTML/CSV generated
 }
 
+type HTMLMeta struct {
+	ClusterName    string
+	ClusterVersion string
+	NCCVersion     string
+}
+
+type HTMLData struct {
+	Rows []Row
+	Now  string
+	Meta HTMLMeta
+}
+
 const termsText = `
 This script is created by Prajwal Vernekar (prajwal.vernekar@nutanix.com).
 
@@ -787,6 +799,32 @@ func ParseSummary(text string) ([]ParsedBlock, error) {
 	return blocks, nil
 }
 
+func parseNCCHeader(path string) (HTMLMeta, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return HTMLMeta{}, err
+	}
+
+	var meta HTMLMeta
+	scanner := bufio.NewScanner(bytes.NewReader(b))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		switch {
+		case strings.HasPrefix(line, "Cluster Name:"):
+			meta.ClusterName = strings.TrimSpace(strings.TrimPrefix(line, "Cluster Name:"))
+		case strings.HasPrefix(line, "Cluster Version:"):
+			meta.ClusterVersion = strings.TrimSpace(strings.TrimPrefix(line, "Cluster Version:"))
+		case strings.HasPrefix(line, "NCC Version:"):
+			meta.NCCVersion = strings.TrimSpace(strings.TrimPrefix(line, "NCC Version:"))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return HTMLMeta{}, err
+	}
+	return meta, nil
+}
+
 /************** Email-Notify **************/
 
 func sendEmail(cfg Config, subj string, body string) error {
@@ -890,54 +928,16 @@ func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary Not
 
 /************** Renderers **************/
 
-// func generateHTML(fs FS, rows []Row, filename string) error {
-// 	const tmpl = `
-// <html>
-// <head>
-// <meta charset="utf-8">
-// <style>
-// table { border: 2px solid black; border-collapse: collapse; width: 100%; }
-// th { border: 2px solid black; padding: 10px; text-align: center; background-color: #f2f2f2; }
-// td { border: 2px solid black; padding: 10px; text-align: left; }
-// .FAIL { background-color: red; color: white; }
-// .WARN { background-color: yellow; color: black; }
-// .INFO { background-color: blue; color: white; }
-// .ERR  { background-color: white; color: black; }
-// </style>
-// </head>
-// <body>
-// <table>
-//     <tr>
-//         <th>Severity</th>
-//         <th>NCC Check Name</th>
-//         <th>Detail Information</th>
-//     </tr>
-//     {{range .}}
-//     <tr>
-//         <td class="{{.Severity}}">{{.Severity}}</td>
-//         <td>{{.CheckName}}</td>
-//         <td>{{.Detail}}</td>
-//     </tr>
-//     {{end}}
-// </table>
-// </body>
-// </html>
-// `
-// 	f, err := fs.Create(filename)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer f.Close()
-// 	t := template.Must(template.New("table").Parse(tmpl))
-// 	return t.Execute(f, rows)
+// func generateHTMLNoMeta(fs FS, rows []Row, filename string) error {
+// 	return generateHTML(fs, rows, filename, HTMLMeta{})
 // }
 
-func generateHTML(fs FS, rows []Row, filename string) error {
+func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
 	const tmpl = `
 <html>
 <head>
   <meta charset="utf-8">
-  <title>NCC Report</title>
+  <title>NCC Report - {{.Meta.ClusterName}}</title>
   <style>
     :root {
       --fail: #ef4444;
@@ -965,42 +965,122 @@ func generateHTML(fs FS, rows []Row, filename string) error {
     .sev.INFO { color: #fff; background: var(--info); }
     .sev.ERR  { color: #111827; background: #e5e7eb; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+
+	body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  color: #111827;
+  background: #f9fafb;
+}
+.page {
+  max-width: 1100px;
+  margin: 24px auto;
+  padding: 0 16px 24px;
+}
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+h1 {
+  margin: 0;
+  font-size: 22px;
+}
+.subtitle {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #6b7280;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.tag {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  display: inline-flex;
+  gap: 4px;
+}
+.tag .label {
+  color: #6b7280;
+}
+.tag .value {
+  font-weight: 600;
+  color: #111827;
+}
+
+/* keep your existing table / sev / mono styles */
+
   </style>
 </head>
 <body>
-  <h1>NCC Report</h1>
-  <div class="meta">Generated at {{.Now}}</div>
-  <table>
-    <thead>
-      <tr>
-        <th style="width:120px">Severity</th>
-        <th style="width:360px">NCC Check Name</th>
-        <th>Detail Information</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{range .Rows}}
-      <tr>
-        <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
-        <td class="mono">{{.CheckName}}</td>
-        <td class="mono">{{.Detail}}</td>
-      </tr>
-      {{end}}
-    </tbody>
-  </table>
+  <div class="page">
+    <header class="header">
+      <div>
+        <h1>NCC Report</h1>
+        <div class="subtitle">{{.Meta.ClusterName}}</div>
+      </div>
+      <div class="tags">
+        <div class="tag">
+          <span class="label">Cluster</span>
+          <span class="value">{{.Meta.ClusterName}}</span>
+        </div>
+        <div class="tag">
+          <span class="label">Cluster Version</span>
+          <span class="value">{{.Meta.ClusterVersion}}</span>
+        </div>
+        <div class="tag">
+          <span class="label">NCC Version</span>
+          <span class="value">{{.Meta.NCCVersion}}</span>
+        </div>
+        <div class="tag">
+          <span class="label">Generated</span>
+          <span class="value">{{.Now}}</span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <table>
+        <thead>
+        <tr>
+          <th style="width:110px">Severity</th>
+          <th style="width:320px">NCC Check Name</th>
+          <th>Detail Information</th>
+        </tr>
+        </thead>
+        <tbody>
+        {{range .Rows}}
+        <tr>
+          <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
+          <td class="mono">{{.CheckName}}</td>
+          <td class="mono">{{.Detail}}</td>
+        </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </main>
+  </div>
 </body>
+
 </html>`
 	f, err := fs.Create(filename)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	data := struct {
-		Rows []Row
-		Now  string
-	}{
+
+	data := HTMLData{
 		Rows: rows,
 		Now:  time.Now().Format(time.RFC3339),
+		Meta: meta,
 	}
 	t := template.Must(template.New("table").Parse(tmpl))
 	return t.Execute(f, data)
@@ -1041,10 +1121,13 @@ func rowsFromBlocks(blocks []ParsedBlock) []Row {
 /************** Aggregation **************/
 
 type AggBlock struct {
-	Cluster  string
-	Severity string
-	Check    string
-	Detail   string
+	Cluster        string
+	Severity       string
+	Check          string
+	Detail         string
+	ClusterName    string
+	ClusterVersion string
+	NCCVersion     string
 }
 
 func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster []struct{ Cluster, HTML, CSV string }) error {
@@ -1057,7 +1140,9 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	<html>
 	<head>
 	<meta charset="utf-8">
+  	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>NCC Aggregated Report</title>
+	  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
 	<style>
 	:root {
 	  --bg: #0f172a;
@@ -1081,8 +1166,9 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
 	  background: linear-gradient(180deg,#0b1224,#0e1630);
 	  color: var(--text);
+    background-color: var(--row1);
 	}
-	.container { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
+	.container { max-width: 1400px; margin: 0 auto; padding: 7px 12px; }
 	.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 	.title h1 { margin: 0; font-size: 22px; font-weight: 700; }
 	.title .sub { color: var(--muted); font-size: 12px; }
@@ -1097,9 +1183,9 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	.dot.fail{ background: var(--fail); } .dot.warn{ background: var(--warn); }
 	.dot.info{ background: var(--info); } .dot.err{ background: var(--err); }
 	.legend { display:flex; gap:8px; flex-wrap: wrap; }
-	.card { background: #0d152b; border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+	.card { padding: 12px; }
 	
-	/* Summary counters visible */
+	 
 	.summary { display:grid; grid-template-columns: repeat(5, 1fr); gap:12px; margin: 16px 0; }
 	.sum-item { background: #0a1123; border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
 	.sum-item .label { font-size: 12px; color: var(--muted); }
@@ -1109,13 +1195,29 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	.progress.fail > span { background: var(--fail); } .progress.warn > span { background: var(--warn); }
 	.progress.err  > span { background: var(--err); }  .progress.info > span { background: var(--info); }
 	
-	/* Scroll container for wide tables */
-	.scroll { overflow-x: auto; overflow-y: hidden; }
+.scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch; /* smooth mobile scroll */
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  margin: 0 -12px 16px -12px; /* full width minus padding */
+  padding: 12px;
+}
+
+@media (max-width: 1024px) {
+  .scroll {
+    margin: 0 -8px 16px -8px;
+    padding: 8px;
+  }
+}
+
+
 	.scroll::-webkit-scrollbar { height: 10px; }
 	.scroll::-webkit-scrollbar-thumb { background: #22304d; border-radius: 8px; }
 	.scroll::-webkit-scrollbar-track { background: #0a1123; }
 	
-	/* Table */
+	 
 	table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 	thead th {
 	  position: sticky; top: 0; z-index: 1;
@@ -1137,7 +1239,8 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	small.mono { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 	.highlight { background: #3b82f655; }
 	
-	/* Column sizing */
+	 
+	th.col-cname, td.col-cname { width: 190px; }
 	th.col-cluster, td.col-cluster   { width: 140px; }
 	th.col-sev,     td.col-sev       { width: 96px; }
 	th.col-title,   td.col-title     { width: 240px; }
@@ -1145,16 +1248,16 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	th.col-detail,  td.col-detail    { width: 640px; }
 	th.col-actions, td.col-actions   { width: 220px; }
 	
-    td.col-detail { white-space: normal; overflow: visible; }
-    .detail-full { color: var(--details); font-size: 13px; line-height: 1.35; }
+	td.col-detail { white-space: normal; overflow: visible; }
+	.detail-full { color: var(--details); font-size: 13px; line-height: 1.35; }
 	
-	/* Actions */
+	 
 	tbody tr.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
 	.actions { white-space: nowrap; display: inline-flex; gap: 6px; flex-wrap: wrap; }
 	.actions button { background:#0a1123; border:1px solid var(--border); color:var(--text); padding:6px 8px; border-radius:8px; }
 	.actions button:hover { border-color: var(--accent); cursor:pointer; }
 	
-	/* Link styling (URLs) */
+	 
 	a { color: #93c5fd; text-decoration: none; }
 	a:hover { text-decoration: underline; color: #bfdbfe; }
 	a:visited { color: #a5b4fc; }
@@ -1164,7 +1267,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  margin-left: 4px;
 	  color: #64748b;
 	}
-	  /* Custom checkbox - hide default */
+	   
 .control input[type="checkbox"] {
   position: absolute;
   opacity: 0;
@@ -1180,7 +1283,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   justify-content: center;
   position: relative;
   padding-left: 24px;
-  min-height: 16px; /* Match box height */
+  min-height: 16px;  
   cursor: pointer;
   color: var(--muted);
 }
@@ -1191,13 +1294,13 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   position: absolute;
   top: 50%;
   left: 0;
-  transform: translateY(-50%); /* Vertically center the box itself */
+  transform: translateY(-50%);  
   height: 16px;
   width: 16px;
   background-color: #0a1123;
   border: 1px solid var(--border);
   border-radius: 4px;
-  box-sizing: border-box; /* Ensure border is included in size */
+  box-sizing: border-box;  
 }
 
 
@@ -1208,8 +1311,8 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   background-color: var(--muted);
   position: absolute;
   top: 50%;
-  left: 8px; /* Half of box width (16px / 2 = 8px) for horizontal center */
-  transform: translate(-50%, -50%) scale(0); /* Vertical center with translate */
+  left: 8px;  
+  transform: translate(-50%, -50%) scale(0);  
   transition: transform 0.2s ease-in-out;
   border-radius: 2px;
 }
@@ -1220,65 +1323,556 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 }
 
 
-/* Hover effect on box */
+ 
 .control span:hover::before {
   border-color: var(--accent);
 }
 
 
-/* Focus effect for accessibility */
+ 
 .control input[type="checkbox"]:focus + span::before {
   outline: 2px solid var(--accent);
 }
 
+.cluster-meta {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.cluster-wrapper {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 1;
+}
+
+.cluster-display {
+  flex: 1;
+  background: #0a1123;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-height: 20px;
+  cursor: pointer;
+  position: relative;
+  font-size: 13px;
+}
+
+.cluster-display:hover {
+  border-color: var(--accent);
+  background: rgba(37, 99, 235, 0.05);
+}
+
+.cluster-placeholder {
+  color: var(--text);
+}
+
+.cluster-toggle {
+  background: #0a1123;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  min-width: 70px;
+}
+
+.cluster-toggle:hover {
+  border-color: var(--accent);
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.cluster-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,0.8);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cluster-modal-content {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 500px;
+  width: 90%;
+  max-height: 80vh;  /* ✅ Fixed height */
+  overflow-y: auto;  /* ✅ Scroll whole modal */
+}
+
+.cluster-list {
+  max-height: 400px;        /* ✅ Scroll container */
+  overflow-y: auto;         /* ✅ Vertical scroll */
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 16px;
+  background: #0a1123;
+}
+
+.cluster-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.cluster-list::-webkit-scrollbar-track {
+  background: #0a1123;
+  border-radius: 4px;
+}
+
+.cluster-list::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+.cluster-list::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+
+.cluster-item {
+  display: flex;
+  align-items: center;
+  padding: 12px;
+  background: #0a1123;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-bottom: 4px;  /* ✅ Spacing */
+}
+
+.cluster-item:hover {
+  border-color: var(--accent);
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.cluster-item.active {
+  border-color: var(--accent);
+  background: rgba(37, 99, 235, 0.2);
+  color: var(--accent);
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.cluster-status-wrapper {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 1;
+}
+
+.cluster-status {
+  flex: 1;
+  background: #0a1123;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  position: relative;
+  transition: all 0.2s ease;
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+}
+
+.cluster-status:hover {
+  border-color: var(--accent);
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.cluster-status::after {
+  content: "▼";
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.cluster-status-empty {
+  color: var(--muted);
+}
+
+.cluster-edit-btn {
+  background: #0a1123;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.cluster-edit-btn:hover {
+  border-color: var(--accent);
+  background: rgba(37, 99, 235, 0.1);
+}
+
+
+
+.tooltip {
+  position: absolute;
+  z-index: 1000;
+  background: var(--card);
+  color: var(--text);
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  max-width: 450px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  white-space: pre-wrap;
+  pointer-events: none;
+}
+
+.cluster-expand-btn {
+  background: #0a1123 !important;
+  border: 1px solid var(--border) !important;
+  color: var(--accent) !important;
+  padding: 8px 12px !important;
+  border-radius: 6px !important;
+  font-size: 12px !important;
+  cursor: pointer !important;
+  margin-top: 8px !important;
+  width: 100% !important;
+  text-align: left !important;
+}
+
+.cluster-expand-btn:hover {
+  background: rgba(37,99,235,0.1) !important;
+}
+
+.full-cluster-table table th,
+.full-cluster-table table td {
+  padding: 6px 4px !important;
+  text-align: right !important;
+}
+
+.full-cluster-table table th:first-child,
+.full-cluster-table table td:first-child {
+  text-align: left !important;
+}
+
+
+.compact-cluster-table {
+  width: 100%;
+  font-size: 12px;
+  margin-top: 12px;
+}
+
+.compact-cluster-table th,
+.compact-cluster-table td {
+  padding: 6px 4px;
+  text-align: right;
+}
+
+.compact-cluster-table th:first-child,
+.compact-cluster-table td:first-child {
+  text-align: left;
+}
+
+.compact-cluster-table tr:hover {
+  background: rgba(37, 99, 235, 0.05);
+}
+
+.full-cluster-table {
+  display: none;
+  margin-top: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.full-cluster-table.show {
+  display: block;
+}
+
+#detailsToggle {
+  background: #0a1123;
+  border: 1px solid var(--border);
+  color: var(--accent);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+#detailsToggle:hover {
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.expand-clusters-btn {
+  width: 100% !important;
+  background: #0a1123 !important;
+  border: 1px solid var(--border) !important;
+  color: var(--accent) !important;
+  padding: 10px 12px !important;
+  border-radius: 8px !important;
+  font-size: 13px !important;
+  cursor: pointer !important;
+  margin-top: 12px !important;
+}
+
+.expand-clusters-btn:hover {
+  background: rgba(37,99,235,0.15) !important;
+  border-color: var(--accent) !important;
+}
+
+.compact-cluster-table a,
+.full-cluster-table a {
+  color: #93c5fd !important;
+  text-decoration: none !important;
+}
+
+.compact-cluster-table a:hover,
+.full-cluster-table a:hover {
+  text-decoration: underline !important;
+  color: #bfdbfe !important;
+}
+
+
+@media (max-width: 768px) {
+  .controls {
+    flex-direction: column !important;
+    gap: 8px;
+    align-items: stretch;
+  }
+  
+  .control {
+    flex: 1;
+    min-width: 0; /* allow shrinking */
+  }
+  
+  .control input[type="text"] {
+    width: 100%;
+    font-size: 16px; /* mobile zoom fix */
+  }
+}
+
+@media (max-width: 900px) {
+  th.col-kb, td.col-kb,
+  th.col-actions, td.col-actions {
+    display: none; /* Hide KB/Actions on small screens */
+  }
+  
+  th.col-detail, td.col-detail {
+    min-width: 200px; /* Priority for details */
+  }
+}
+
+@media (max-width: 600px) {
+  th.col-cluster, td.col-cluster {
+    display: none; /* Hide IP on tiny screens */
+  }
+  
+  th.col-cname, td.col-cname {
+    width: 140px !important; /* Fixed width for cluster names */
+  }
+}
+
+/* 6. PRINT STYLES (clean PDF export) */
+@media print {
+  .controls, .actions, .summary, footer {
+    display: none !important;
+  }
+  
+  .scroll {
+    overflow: visible !important;
+    border: none !important;
+    margin: 0 !important;
+  }
+  
+  table {
+    font-size: 9px !important;
+    width: 100% !important;
+  }
+  
+  th, td {
+    padding: 4px 2px !important;
+    border-bottom: 1px solid #ccc !important;
+  }
+}
+
+/* 7. MOBILE SUMMARY CARDS (stack vertically) */
+@media (max-width: 768px) {
+  .summary {
+    grid-template-columns: 1fr !important;
+    gap: 8px;
+    margin: 12px 0;
+  }
+}
+
+/* 8. TOUCH TARGETS (min 44px for mobile) */
+button, .cluster-display, .cluster-toggle {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .actions button {
+    padding: 12px 16px; /* bigger touch targets */
+    font-size: 14px;
+  }
+}
+
 	</style>
 	<script>
-	// Embedded data
+
 	const AGG = {{.JSON}};
+
 	
-	// State
-	let state = {
-	  sortKey: "Cluster",
-	  sortDir: "asc",
-	  filterSev: new Set(["FAIL","WARN","ERR","INFO"]),
-	  filterClusters: new Set(),
-	  search: ""
-	};
+let state = {
+  sortKey: "severity",
+  sortDir: "asc",
+  filterSev: new Set(["FAIL","WARN","ERR","INFO"]),
+  filterClusters: new Set(),
+  search: "",
+  showClusterModal: false,   
+  allClusters: []            
+};
 	
 	const sevRank = { FAIL: 1, WARN: 2, ERR: 3, INFO: 4 };
 	let selIndex = -1;
-	
-	function init() {
-	  buildClusterFilter();
-	  updateAndRender();
-	  document.addEventListener("keydown", onKey);
-	}
-	
-	function buildClusterFilter() {
-	  const clusters = Array.from(new Set(AGG.map(r => r.Cluster))).sort();
-	  const sel = document.getElementById("clusterSel");
-	  sel.innerHTML = "";
-	  clusters.forEach(c => {
-		const opt = document.createElement("option");
-		opt.value = c; opt.textContent = c;
-		sel.appendChild(opt);
-	  });
-	  state.filterClusters = new Set(clusters); // select all by default
-	  sel.size = Math.min(6, clusters.length);
-	}
+
+function init() {
+  console.log("AGG length:", AGG.length);
+  initClusters();
+  updateAndRender();
+  document.addEventListener("keydown", onKey);
+  const statusEl = document.getElementById('clusterStatus');
+  if (statusEl) {
+    statusEl.onclick = toggleClusterFilter;
+  }
+}
+
+function initClusters() {
+  const clusters = Array.from(new Set(AGG.map(function(r) { 
+    return r.clusterName || r.cluster; 
+  }))).sort();
+  console.log("Found clusters:", clusters); 
+  state.allClusters = clusters;
+  state.filterClusters = new Set(clusters);
+  updateClusterStatus();
+}
+
+function updateClusterStatus() {
+  const statusEl = document.getElementById('clusterStatus');
+  if (!statusEl) return;
+  const count = state.filterClusters.size;
+  const total = state.allClusters.length || 0;
+  let text, className;
+  if (count === 0) {
+    text = 'No clusters selected';
+    className = 'cluster-status cluster-status-empty';
+  } else if (count === total && total > 0) {
+    text = 'All clusters selected (' + total + ')';
+    className = 'cluster-status';
+  } else {
+    const names = Array.from(state.filterClusters).slice(0, 2);
+    text = names.join(', ') + (count > 2 ? ' +' + (count-2) : '') + ' (' + count + '/' + total + ')';
+    className = 'cluster-status';
+  }
+  statusEl.textContent = text;
+  statusEl.className = className;
+}
+
+
+function toggleCluster(name) {
+  if (state.filterClusters.has(name)) {
+    state.filterClusters.delete(name);
+  } else {
+    state.filterClusters.add(name);
+  }
+  renderClusterList();
+  updateClusterStatus();
+  updateAndRender();
+}
+
+function selectAllClusters() {
+  state.filterClusters = new Set(state.allClusters);
+  renderClusterList();
+  updateClusterStatus();
+  updateAndRender();
+}
+
+function clearAllClusters() {
+  state.filterClusters.clear();
+  renderClusterList();
+  updateClusterStatus();
+  updateAndRender();
+}
+
+function toggleClusterFilter() {
+  state.showClusterModal = !state.showClusterModal;
+  if (state.showClusterModal) {
+    showClusterModal();
+  } else {
+    hideClusterModal();
+  }
+}
+
+function showClusterModal() {
+  if (document.getElementById('clusterModal')) return;
+  
+  const modal = document.createElement('div');
+  modal.id = 'clusterModal';
+  modal.className = 'cluster-modal';
+  modal.innerHTML = [
+    '<div class="cluster-modal-content">',
+      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">',
+        '<h3 style="margin: 0; font-size: 18px;">Select Clusters</h3>',
+        '<button type="button" onclick="toggleClusterFilter()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;">✕</button>',
+      '</div>',
+      '<div class="cluster-list" id="clusterList"></div>',
+      '<div class="modal-buttons">',
+        '<button type="button" onclick="selectAllClusters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: #0a1123; color: var(--text);">Select All</button>',
+        '<button type="button" onclick="clearAllClusters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: #0a1123; color: var(--text);">Clear All</button>',
+        '<button type="button" onclick="toggleClusterFilter()" style="padding: 8px 16px; border-radius: 6px; background: var(--accent); color: white; border: none;">Done</button>',
+      '</div>',
+    '</div>'
+  ].join('');
+  
+  document.body.appendChild(modal);
+  renderClusterList();
+}
+
+function hideClusterModal() {
+  const modal = document.getElementById('clusterModal');
+  if (modal) modal.remove();
+}
+
+function renderClusterList() {
+  const list = document.getElementById('clusterList');
+  if (!list) return;
+  
+  const items = state.allClusters.map(function(name) {
+    const active = state.filterClusters.has(name) ? 'active' : '';
+    const safeName = escapeHtml(name);
+    return '<div class="cluster-item ' + active + '" onclick="toggleCluster(\'' + safeName + '\')">' + safeName + '</div>';
+  });
+  list.innerHTML = items.join('');
+}
 	
 	function setSev(checked, sev) {
 	  if (checked) state.filterSev.add(sev); else state.filterSev.delete(sev);
-	  updateAndRender();
-	}
-	
-	function onClusterChange(sel) {
-	  const chosen = new Set(Array.from(sel.selectedOptions).map(o => o.value));
-	  if (chosen.size === 0) {
-		Array.from(sel.options).forEach(o => o.selected = true);
-		chosen.clear(); Array.from(sel.options).forEach(o => chosen.add(o.value));
-	  }
-	  state.filterClusters = chosen;
 	  updateAndRender();
 	}
 	
@@ -1299,72 +1893,53 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  updateAndRender();
 	}
 	
-	function filterData() {
-	  const needle = state.search.toLowerCase();
-	  return AGG.filter(r => {
-		if (!state.filterSev.has(r.Severity)) return false;
-		if (!state.filterClusters.has(r.Cluster)) return false;
-		if (!needle) return true;
-		const hay = (r.Cluster + " " + r.Severity + " " + r.Check + " " + r.Detail).toLowerCase();
-		return hay.includes(needle);
-	  });
-	}
-	
+function filterData() {
+  const needle = state.search.toLowerCase();
+  return AGG.filter(r => {
+    if (!state.filterSev.has(r.severity)) return false;
+    const clusterId = r.clusterName || r.cluster;
+    if (!state.filterClusters.has(clusterId)) return false;
+    if (!needle) return true;
+    const hay = (clusterId + " " + r.severity + " " + r.check + " " + r.detail).toLowerCase();
+    return hay.includes(needle);
+  });
+}
+
+
 	function sortData(rows) {
 	  const k = state.sortKey, dir = state.sortDir;
 	  const mul = dir === "asc" ? 1 : -1;
 	  rows.sort((a,b) => {
 		let av = a[k], bv = b[k];
-		if (k === "Severity") { av = sevRank[av] || 99; bv = sevRank[bv] || 99; }
+		if (k === "severity") { av = sevRank[av] || 99; bv = sevRank[bv] || 99; }
 		return (av > bv ? 1 : av < bv ? -1 : 0) * mul;
 	  });
 	  return rows;
 	}
 	
-	function updateCounts(rows) {
-	  const total = rows.length;
-	  const cnt = { FAIL:0, WARN:0, ERR:0, INFO:0 };
-	  rows.forEach(r => { if (cnt[r.Severity] !== undefined) cnt[r.Severity]++; });
-	
-	  document.getElementById("countTotal").textContent = total;
-	  document.getElementById("countFail").textContent = cnt.FAIL;
-	  document.getElementById("countWarn").textContent = cnt.WARN;
-	  document.getElementById("countErr").textContent  = cnt.ERR;
-	  document.getElementById("countInfo").textContent = cnt.INFO;
-	
-	  const pct = {};
-	  Object.keys(cnt).forEach(k => pct[k] = total ? Math.round(cnt[k]*100/total) : 0);
-	  document.getElementById("barFail").style.width = pct.FAIL + "%";
-	  document.getElementById("barWarn").style.width = pct.WARN + "%";
-	  document.getElementById("barErr").style.width  = pct.ERR  + "%";
-	  document.getElementById("barInfo").style.width = pct.INFO + "%";
-	
-	  // Per-cluster summary with links
-	  const pc = document.getElementById("perCluster");
-	  pc.innerHTML = "";
-	  const map = {};
-	  rows.forEach(r => {
-		map[r.Cluster] = map[r.Cluster] || { FAIL:0,WARN:0,ERR:0,INFO:0, total:0 };
-		map[r.Cluster][r.Severity]++; map[r.Cluster].total++;
-	  });
-	  const table = document.createElement("table");
-	  table.innerHTML = '<thead><tr><th>Cluster</th><th>FAIL</th><th>WARN</th><th>ERR</th><th>INFO</th><th>Total</th></tr></thead><tbody></tbody>';
-	  const tb = table.querySelector("tbody");
-	  Object.keys(map).sort().forEach(c => {
-		const m = map[c];
-		const tr = document.createElement("tr");
-		const link = encodeURIComponent(c) + '.log.html';
-		tr.innerHTML =
-		  '<td><a class="mono" href="' + link + '">' + escapeHtml(c) + '</a></td>' +
-		  '<td><span class="severity sev-FAIL">' + m.FAIL + '</span></td>' +
-		  '<td><span class="severity sev-WARN">' + m.WARN + '</span></td>' +
-		  '<td><span class="severity sev-ERR">'  + m.ERR  + '</span></td>' +
-		  '<td><span class="severity sev-INFO">' + m.INFO + '</span></td>' +
-		  '<td>' + m.total + '</td>';
-		tb.appendChild(tr);
-	  });
-	  pc.appendChild(table);
-	}
+function updateCounts(rows) {
+  const total = rows.length;
+  const cnt = { FAIL:0, WARN:0, ERR:0, INFO:0 };
+  rows.forEach(r => { if (cnt[r.severity] !== undefined) cnt[r.severity]++; });
+
+  // Update main summary counts ONLY
+  document.getElementById("countTotal").textContent = total;
+  document.getElementById("countFail").textContent = cnt.FAIL;
+  document.getElementById("countWarn").textContent = cnt.WARN;
+  document.getElementById("countErr").textContent  = cnt.ERR;
+  document.getElementById("countInfo").textContent = cnt.INFO;
+
+  const pct = {};
+  Object.keys(cnt).forEach(k => pct[k] = total ? Math.round(cnt[k]*100/total) : 0);
+  document.getElementById("barFail").style.width = pct.FAIL + "%";
+  document.getElementById("barWarn").style.width = pct.WARN + "%";
+  document.getElementById("barErr").style.width  = pct.ERR  + "%";
+  document.getElementById("barInfo").style.width = pct.INFO + "%";
+
+  <!-- const pc = document.getElementById("perCluster"); pc.innerHTML = ""; -->
+}
+
+
 	
 	function extractKB(detail) {
 	  const text = detail || "";
@@ -1410,43 +1985,147 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 		document.body.removeChild(ta);
 	  }
 	}
+
 	
-	function renderTable(rows) {
-	  const tbody = document.getElementById("tbody");
-	  tbody.innerHTML = "";
-	  const needle = state.search;
-	  const frag = document.createDocumentFragment();
-	  rows.forEach((r, idx) => {
-		const tr = document.createElement("tr");
-		tr.setAttribute("tabindex", "0");
-		tr.dataset.index = idx.toString();
-	
-		const detailEsc = (r.Detail || "").replaceAll("\\n","<br>");
-	
-		const kb = extractKB(r.Detail);
-		const kbCell = kb ? ('<a href="' + kb + '" target="_blank" rel="noopener">' + kbLabel(kb) + '</a>') : '';
-		const clusterUrl = 'https://' + encodeURIComponent(r.Cluster) + ':9440';
-		const rowText = (r.Cluster + " " + r.Severity + " " + r.Check + " " + (r.Detail || "")).trim();
-		const actHTML =
-		  '<div class="actions">' +
-		  '<button onclick="copyText(\'' + jsEscape(rowText) + '\')">Copy row</button>' +
-		  '<button onclick="copyText(\'' + jsEscape(r.Detail || "") + '\')">Copy detail</button>' +
-		  '</div>';
-		const checkTitle = formatCheckTitle(r.Check || "");
-		tr.innerHTML =
-		  '<td class="col-cluster"><small class="mono"><a href="' + clusterUrl + '" target="_blank" rel="noopener">' + highlight(r.Cluster, needle) + '</a></small></td>' +
-		  '<td class="col-sev"><span class="severity sev-' + r.Severity + '">' + r.Severity + '</span></td>' +
-		  '<td class="col-title"><small class="mono">' + highlight(checkTitle, needle) + '</small></td>' +
-		  '<td class="col-kb">' + kbCell + '</td>' +
-		  '<td class="col-detail"><div class="detail-full">' + highlight(detailEsc, needle) + '</div></td>' +
-		  '<td class="col-actions">' + actHTML + '</td>';
-	
-		tr.addEventListener("focus", () => selectRow(tr));
-		frag.appendChild(tr);
-	  });
-	  tbody.appendChild(frag);
-	}
-	
+  function renderTable(rows) {
+  const tbody = document.getElementById("tbody");
+  tbody.innerHTML = "";
+  const needle = state.search;
+  const frag = document.createDocumentFragment();
+  
+  rows.forEach((r, idx) => {
+    const tr = document.createElement("tr");
+    tr.setAttribute("tabindex", "0");
+    tr.dataset.index = idx.toString();
+    
+    const detailEsc = (r.detail || "").replaceAll("\\n","<br>");
+    const nameLine = escapeHtml(r.clusterName || "-");
+    const verLine = escapeHtml(r.clusterVersion || "");
+    const nccLine = escapeHtml(r.nccVersion || "");
+    const checkTitle = formatCheckTitle(r.check || "");
+    const kb = extractKB(r.detail);
+    const kbCell = kb ? ('<a href="' + kb + '" target="_blank" rel="noopener">' + kbLabel(kb) + '</a>') : '';
+    const clusterUrl = 'https://' + encodeURIComponent(r.cluster) + ':9440';
+    const rowText = (r.cluster + " " + r.severity + " " + r.check + " " + (r.detail || "")).trim();
+    const actHTML = '<div class="actions">' +
+      '<button onclick="copyText(\'' + jsEscape(rowText) + '\')">Copy row</button>' +
+      '<button onclick="copyText(\'' + jsEscape(r.detail || "") + '\')">Copy detail</button>' +
+      '</div>';
+    
+    
+    const nameCell = '<td class="col-cname">' +
+      '<div class="mono" style="color: var(--text); font-weight: 600;">' + highlight(nameLine, needle) + '</div>' +
+      '<div class="cluster-meta mono">' +
+      (verLine ? ('<div>Version: ' + highlight(verLine, needle) + '</div>') : '') +
+      (nccLine ? ('<div>NCC: ' + highlight(nccLine, needle) + '</div>') : '') +
+      '</div></td>';
+    
+    const clusterCell = '<td class="col-cluster">' +
+      '<small class="mono has-tooltip" data-fulltext="' + escapeHtml(r.cluster) + '">' +
+      '<a href="' + clusterUrl + '" target="_blank" rel="noopener">' + highlight(r.cluster, needle) + '</a>' +
+      '</small></td>';
+    
+    const titleCell = '<td class="col-title">' +
+      '<small class="mono has-tooltip" data-fulltext="' + escapeHtml(checkTitle) + '">' +
+      highlight(checkTitle, needle) +
+      '</small></td>';
+    
+    const detailCell = '<td class="col-detail">' +
+      '<div class="detail-full has-tooltip" data-fulltext="' + jsEscape(r.detail || "") + '"' +
+      ' style="max-height: 60px; overflow-y: auto;">' +
+      highlight(detailEsc, needle) +
+      '</div></td>';
+    
+    tr.innerHTML = nameCell + clusterCell +
+      '<td class="col-sev"><span class="severity sev-' + r.severity + '">' + r.severity + '</span></td>' +
+      titleCell + '<td class="col-kb">' + kbCell + '</td>' + detailCell +
+      '<td class="col-actions">' + actHTML + '</td>';
+    
+    tr.addEventListener("focus", () => selectRow(tr));
+    frag.appendChild(tr);
+  });
+  
+  tbody.appendChild(frag);
+  setTimeout(initTooltips, 0);
+}
+
+
+let tooltip = null;
+let tooltipTimeout = null;
+
+function showTooltip(event, text) {
+  
+  if (tooltipTimeout) clearTimeout(tooltipTimeout);
+  
+  if (!text || text.length < 20) return; 
+  
+  
+  if (tooltip) {
+    tooltip.remove();
+    tooltip = null;
+  }
+  
+  tooltip = document.createElement('div');
+  tooltip.className = 'tooltip';
+  tooltip.textContent = text;
+  document.body.appendChild(tooltip);
+  
+  
+  const rect = event.target.getBoundingClientRect();
+  const tooltipRect = tooltip.getBoundingClientRect();
+  
+  
+  let top = event.clientY - tooltipRect.height - 10;
+  let left = event.clientX - tooltipRect.width / 2;
+  
+  
+  if (top < 10) top = event.clientY + 20;
+  if (left < 10) left = 10;
+  if (left + tooltipRect.width > window.innerWidth - 10) {
+    left = window.innerWidth - tooltipRect.width - 10;
+  }
+  
+  tooltip.style.position = 'fixed';
+  tooltip.style.left = left + 'px';
+  tooltip.style.top = top + 'px';
+}
+
+function hideTooltip() {
+  if (tooltipTimeout) clearTimeout(tooltipTimeout);
+  tooltipTimeout = setTimeout(() => {
+    if (tooltip) {
+      tooltip.remove();
+      tooltip = null;
+    }
+  }, 50); 
+}
+
+function initTooltips() {
+  
+  document.querySelectorAll('.has-tooltip').forEach(el => {
+    el.removeEventListener('mouseenter', el._ttEnter);
+    el.removeEventListener('mouseleave', el._ttLeave);
+    el.removeEventListener('mousemove', el._ttMove);
+  });
+  
+  
+  document.querySelectorAll('.has-tooltip').forEach(el => {
+    const text = el.dataset.fulltext || '';
+    if (text.length < 20) return; 
+    
+    el._ttEnter = (e) => showTooltip(e, text);
+    el._ttLeave = hideTooltip;
+    el._ttMove = (e) => {
+      if (tooltip && text.length >= 20) {
+        showTooltip(e, text); 
+      }
+    };
+    
+    el.addEventListener('mouseenter', el._ttEnter);
+    el.addEventListener('mouseleave', el._ttLeave);
+    el.addEventListener('mousemove', el._ttMove);
+  });
+}
 	function selectRow(tr) {
 	  const tbody = document.getElementById("tbody");
 	  Array.from(tbody.querySelectorAll("tr.selected")).forEach(x => x.classList.remove("selected"));
@@ -1487,10 +2166,10 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	
 	function updateAndRender() {
 	  let rows = filterData();
-	  // Update visible counters
+	  
 	  const total = rows.length;
 	  const cnt = { FAIL:0, WARN:0, ERR:0, INFO:0 };
-	  rows.forEach(r => { if (cnt[r.Severity] !== undefined) cnt[r.Severity]++; });
+	  rows.forEach(r => { if (cnt[r.severity] !== undefined) cnt[r.severity]++; });
 	  document.getElementById("countTotal").textContent = total;
 	  document.getElementById("countFail").textContent = cnt.FAIL;
 	  document.getElementById("countWarn").textContent = cnt.WARN;
@@ -1503,7 +2182,7 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	  document.getElementById("barErr").style.width  = pct.ERR  + "%";
 	  document.getElementById("barInfo").style.width = pct.INFO + "%";
 	
-	  // Per-cluster summary and table
+	  
 	  updateCounts(rows);
 	  rows = sortData(rows.slice());
 	  renderTable(rows);
@@ -1514,8 +2193,8 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 		const headers = ["Cluster","Severity","NCC Alert Title","Detail"];
 		const lines = [headers.join(",")];
 		rows.forEach(r => {
-		  const title = formatCheckTitle(r.Check || "");
-		  const row = [r.Cluster, r.Severity, title, r.Detail || ""].map(v => {
+		  const title = formatCheckTitle(r.check || "");
+		  const row = [r.cluster, r.severity, title, r.detail || ""].map(v => {
 		    const s = (v ?? "").toString().replaceAll('"','""').replaceAll("\r"," ").replaceAll("\n","\\n");
 		    return '"' + s + '"';
 		  }).join(",");
@@ -1582,10 +2261,13 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
     <span style="color: var(--info);">INFO</span>
   </label>
 		</div>
-		<div class="control">
-		  <label>Clusters</label>
-		  <select id="clusterSel" multiple onchange="onClusterChange(this)"></select>
-		</div>
+<div class="control">
+  <label>Clusters</label>
+  <div class="cluster-status-wrapper">
+    <div id="clusterStatus" class="cluster-status">All clusters selected (4)</div>
+    <!-- <button class="cluster-edit-btn" onclick="toggleClusterFilter()">⚙️ Edit</button> -->
+  </div>
+</div>
 		<div class="control">
 		  <button onclick="downloadCSV()">Export CSV</button>
 		  <button onclick="downloadJSON()">Export JSON</button>
@@ -1619,19 +2301,15 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 		</div>
 	  </div>
 	
-	  <div class="card" style="margin-bottom:14px">
-		<div class="label" style="margin-bottom:8px">Per-Cluster Summary</div>
-		<div id="perCluster"></div>
-	  </div>
-	
 	  <div class="card">
 		<div class="scroll">
 		  <table>
 			<thead>
 			  <tr>
-				<th class="col-cluster" onclick="sortBy('Cluster')">Cluster</th>
-				<th class="col-sev" onclick="sortBy('Severity')">Severity</th>
-				<th class="col-title" onclick="sortBy('Check')">NCC Alert Title</th>
+			  	<th class="col-cname" onclick="sortBy('clusterName')">Cluster Name</th>
+				<th class="col-cluster" onclick="sortBy('cluster')">Cluster</th>
+				<th class="col-sev" onclick="sortBy('severity')">Severity</th>
+				<th class="col-title" onclick="sortBy('check')">NCC Alert Title</th>
 				<th class="col-kb">KB</th>
 				<th class="col-detail">Detail</th>
 				<th class="col-actions">Actions</th>
@@ -1664,26 +2342,42 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 
 	// Build data for template with embedded JSON
 	type tmplRow struct {
-		Cluster  string
-		Severity string
-		Check    string
-		Detail   string
+		Cluster        string `json:"cluster"`
+		Severity       string `json:"severity"`
+		Check          string `json:"check"`
+		Detail         string `json:"detail"`
+		ClusterName    string `json:"clusterName"`
+		ClusterVersion string `json:"clusterVersion"`
+		NCCVersion     string `json:"nccVersion"`
 	}
+
 	aggRows := make([]tmplRow, 0, len(rows))
 	for _, r := range rows {
-		aggRows = append(aggRows, tmplRow(r))
+		aggRows = append(aggRows, tmplRow{
+			Cluster:        r.Cluster,
+			Severity:       r.Severity,
+			Check:          r.Check,
+			Detail:         r.Detail,
+			ClusterName:    r.ClusterName,
+			ClusterVersion: r.ClusterVersion,
+			NCCVersion:     r.NCCVersion,
+		})
 	}
-	// Embed JSON safely
+
 	jsonBytes, err := json.Marshal(aggRows)
 	if err != nil {
 		return fmt.Errorf("marshal agg json: %w", err)
 	}
+
 	data := struct {
-		JSON        template.JS
-		Clusters    []struct{ Cluster, HTML, CSV string }
-		GeneratedAt string
+		JSON           template.JS
+		Clusters       []struct{ Cluster, HTML, CSV string }
+		GeneratedAt    string
+		ClusterName    string
+		ClusterVersion string
+		NCCVersion     string
 	}{
-		JSON:        template.JS(jsonBytes), // trusted program output
+		JSON:        template.JS(jsonBytes),
 		Clusters:    perCluster,
 		GeneratedAt: time.Now().Format(time.RFC3339),
 	}
@@ -2104,7 +2798,10 @@ SUMMARY:
 		switch strings.ToLower(strings.TrimSpace(f)) {
 		case "html":
 			htmlFile := base + ".html"
-			if err := generateHTML(fs, rowsFromBlocks(blocks), htmlFile); err != nil {
+			rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+			meta, _ := parseNCCHeader(rawPath) // ignore error if file missing
+			rows := rowsFromBlocks(blocks)
+			if err := generateHTML(fs, rows, htmlFile, meta); err != nil {
 				l.Error().Err(err).Str("file", htmlFile).Msg("write HTML failed")
 				return nil, err
 			}
@@ -2158,35 +2855,44 @@ func promptPasswordIfEmpty(p string, Username string) (string, error) {
 }
 
 var (
-	Version   string = "0.1.9"
+	Version   string
 	BuildDate string
 	GoVersion string
 	Stream    string // e.g., "prod", "dev", "beta"
 )
 
 func init() {
-	var gitRevision string
+	// Defaults
+	if Version == "" {
+		Version = "0.1.10"
+	}
+	if BuildDate == "" {
+		BuildDate = "unknown"
+	}
+	if Stream == "" {
+		Stream = "Alpha"
+	}
+
+	// Optional build info enrichment
 	if bi, ok := debug.ReadBuildInfo(); ok {
+		if GoVersion == "" {
+			GoVersion = bi.GoVersion
+		}
+
+		var gitRevision string
 		for _, s := range bi.Settings {
-			if s.Key == "vcs.revision" {
+			if s.Key == "vcs.revision" && s.Value != "" {
 				gitRevision = s.Value
 				break
 			}
 		}
-		if GoVersion == "" {
-			GoVersion = bi.GoVersion
+		if gitRevision != "" {
+			Version = Version + "-" + gitRevision
 		}
 	}
-	if gitRevision != "" {
-		Version = Version + "-" + gitRevision
-	} else {
-		Version = "unknown"
-	}
-	if BuildDate == "" {
-		BuildDate = "unknown" // Override at build time with -ldflags
-	}
-	if Stream == "" {
-		Stream = "Alpha" // Default; override via build or config
+
+	if GoVersion == "" {
+		GoVersion = "unknown"
 	}
 }
 
@@ -2387,7 +3093,22 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						_ = writePrometheusFile(fs, cfg.PromDir, cluster, blocks)
 						switch strings.ToLower(strings.TrimSpace(f)) {
 						case "html":
-							_ = generateHTML(OSFS{}, rowsFromBlocks(blocks), base+".html")
+							htmlFile := base + ".html"
+
+							// raw NCC log for this cluster, reused in replay
+							rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+
+							meta, err := parseNCCHeader(rawPath)
+							if err != nil {
+								// fall back to no meta if header log not present in older runs
+								log.Warn().Err(err).Str("rawPath", rawPath).Msg("replay: parseNCCHeader failed, using empty meta")
+								meta = HTMLMeta{}
+							}
+
+							// 4‑arg version that uses meta in template
+							if err := generateHTML(OSFS{}, rowsFromBlocks(blocks), htmlFile, meta); err != nil {
+								log.Error().Err(err).Str("file", htmlFile).Msg("replay: write HTML failed")
+							}
 						case "csv":
 							_ = generateCSV(OSFS{}, blocks, base+".csv")
 						}
@@ -2402,12 +3123,18 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						HTML:    filepath.Base(base + ".html"),
 						CSV:     filepath.Base(base + ".csv"),
 					})
+					rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+					meta, _ := parseNCCHeader(rawPath) // ignore error
+
 					for _, b := range blocks {
 						agg = append(agg, AggBlock{
-							Cluster:  cluster,
-							Severity: b.Severity,
-							Check:    b.CheckName,
-							Detail:   b.DetailRaw,
+							Cluster:        cluster,
+							Severity:       b.Severity,
+							Check:          b.CheckName,
+							Detail:         b.DetailRaw,
+							ClusterName:    meta.ClusterName,
+							ClusterVersion: meta.ClusterVersion,
+							NCCVersion:     meta.NCCVersion,
 						})
 					}
 				}
@@ -2514,12 +3241,19 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 					failed = append(failed, r.Cluster)
 					continue
 				}
+
+				rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", r.Cluster))
+				meta, _ := parseNCCHeader(rawPath) // ignore error
+
 				for _, b := range r.Blocks {
 					agg = append(agg, AggBlock{
-						Cluster:  r.Cluster,
-						Severity: b.Severity,
-						Check:    b.CheckName,
-						Detail:   b.DetailRaw,
+						Cluster:        r.Cluster,
+						Severity:       b.Severity,
+						Check:          b.CheckName,
+						Detail:         b.DetailRaw,
+						ClusterName:    meta.ClusterName,
+						ClusterVersion: meta.ClusterVersion,
+						NCCVersion:     meta.NCCVersion,
 					})
 				}
 				basePath := filepath.Join(cfg.OutputDirFiltered, fmt.Sprintf("%s.log", r.Cluster))
