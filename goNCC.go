@@ -902,10 +902,16 @@ func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary Not
 
 	// simple retry loop using existing helpers
 	for attempt := 1; attempt <= cfg.RetryMaxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		resp, err := client.Do(req)
 		if err != nil {
 			if attempt == cfg.RetryMaxAttempts {
-				return err
+				return fmt.Errorf("webhook request failed: %w", err)
 			}
 		} else {
 			io.Copy(io.Discard, resp.Body)
@@ -917,13 +923,22 @@ func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary Not
 				return fmt.Errorf("webhook status %d", resp.StatusCode)
 			}
 			if d, ok := retryAfterDelay(resp); ok {
-				time.Sleep(d)
-				continue
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(d):
+					continue
+				}
 			}
 		}
-		time.Sleep(jitteredBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, attempt))
+		backoff := jitteredBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, attempt)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
 	}
-	return nil
+	return fmt.Errorf("webhook exhausted retries")
 }
 
 /************** Renderers **************/
@@ -2543,7 +2558,7 @@ func (c *NCCClient) StartChecks(ctx context.Context) (string, []byte, error) {
 	resp, body, err := doWithRetry(ctx, c.http, req, c.cfg, "start checks")
 	if err != nil {
 		log.Error().Err(err).Str("url", url).Str("method", "POST").Msg("http do error")
-		return "", body, err
+		return "", body, fmt.Errorf("start checks: %w", err)
 	}
 	_ = resp
 	log.Debug().Str("url", url).RawJSON("body", body).Msg("start checks response")
@@ -2576,7 +2591,7 @@ func (c *NCCClient) GetTask(ctx context.Context, taskID string) (TaskStatus, []b
 	resp, body, err := doWithRetry(ctx, c.http, req, c.cfg, "get task")
 	if err != nil {
 		log.Error().Err(err).Str("url", url).Msg("http do error")
-		return TaskStatus{}, body, err
+		return TaskStatus{}, body, fmt.Errorf("get task: %w", err)
 	}
 	_ = resp
 	log.Debug().Str("url", url).RawJSON("body", body).Msg("get task response")
@@ -2600,7 +2615,7 @@ func (c *NCCClient) GetRunSummary(ctx context.Context, taskID string) (NCCSummar
 	resp, body, err := doWithRetry(ctx, c.http, req, c.cfg, "get summary")
 	if err != nil {
 		log.Error().Err(err).Str("url", url).Msg("http do error")
-		return NCCSummary{}, body, err
+		return NCCSummary{}, body, fmt.Errorf("get summary: %w", err)
 	}
 	_ = resp
 	log.Debug().Str("url", url).RawJSON("body", body).Msg("get summary response")
@@ -2630,18 +2645,18 @@ func writeSummary(fs FS, folder, cluster, summary string) (string, error) {
 	return outPath, nil
 }
 
-func filterBlocksToFile(fs FS, inputPath, outputPath string) error {
+func filterBlocksToFile(fs FS, inputPath, outputPath string) ([]ParsedBlock, error) {
 	data, err := fs.ReadFile(inputPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	log.Debug().Str("path", inputPath).Int("bytes", len(data)).Msg("read raw log")
 	blocks, err := ParseSummary(string(data))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := fs.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
-		return err
+		return nil, err
 	}
 	var b strings.Builder
 	for _, pb := range blocks {
@@ -2651,10 +2666,10 @@ func filterBlocksToFile(fs FS, inputPath, outputPath string) error {
 		b.WriteString("\n\n---------------------------------------\n")
 	}
 	if err := fs.WriteFile(outputPath, []byte(b.String()), 0644); err != nil {
-		return err
+		return nil, err
 	}
 	log.Debug().Str("path", outputPath).Int("bytes", len(b.String())).Msg("wrote filtered")
-	return nil
+	return blocks, nil
 }
 
 func runClusterWithBars(
@@ -2686,10 +2701,7 @@ func runClusterWithBars(
 		case <-ctx.Done():
 			l.Error().Err(ctx.Err()).Msg("context done during polling")
 			return nil, ctx.Err()
-		case <-func() <-chan time.Time {
-			jitter := time.Duration(rand.Int63n(int64(cfg.PollJitter)))
-			return time.After(cfg.PollInterval + jitter)
-		}():
+		case <-time.After(cfg.PollInterval + time.Duration(rand.Int63n(int64(cfg.PollJitter)))):
 			if dl, ok := ctx.Deadline(); ok {
 				rem := time.Until(dl)
 				if rem < 10*time.Second {
@@ -2737,24 +2749,14 @@ SUMMARY:
 	}
 	l.Info().Str("logPath", logPath).Msg("summary written")
 
+	// Parse blocks and write filtered file in one operation to avoid duplicate parsing
 	filteredPath := filepath.Join(cfg.OutputDirFiltered, fmt.Sprintf("%s.log", cluster))
-	if err := filterBlocksToFile(fs, logPath, filteredPath); err != nil {
+	blocks, err := filterBlocksToFile(fs, logPath, filteredPath)
+	if err != nil {
 		l.Error().Err(err).Msg("filter blocks failed")
 		return nil, err
 	}
 	l.Info().Str("filteredPath", filteredPath).Msg("filtered written")
-
-	data, err := fs.ReadFile(filteredPath)
-	if err != nil {
-		l.Error().Err(err).Msg("read filtered failed")
-		return nil, err
-	}
-	l.Debug().Str("path", filteredPath).Int("bytes", len(data)).Msg("read filtered bytes")
-	blocks, err := ParseSummary(string(data))
-	if err != nil {
-		l.Error().Err(err).Msg("parse filtered failed")
-		return nil, err
-	}
 	counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
 	for _, b := range blocks {
 		sev := b.Severity
@@ -2792,9 +2794,15 @@ SUMMARY:
 		l.Warn().Str("path", filteredPath).Msg("no blocks parsed from summary")
 	}
 
+	// Write Prometheus file once, outside the loop
+	if err := writePrometheusFile(fs, cfg.PromDir, cluster, blocks); err != nil {
+		l.Error().Err(err).Msg("write Prometheus .prom failed")
+	} else {
+		log.Info().Str("cluster", cluster).Str("prom_dir", cfg.PromDir).Msg("Prometheus .prom written")
+	}
+
 	base := filteredPath
 	for _, f := range cfg.OutputFormats {
-		_ = writePrometheusFile(fs, cfg.PromDir, cluster, blocks)
 		switch strings.ToLower(strings.TrimSpace(f)) {
 		case "html":
 			htmlFile := base + ".html"
@@ -2816,10 +2824,6 @@ SUMMARY:
 		default:
 			l.Warn().Str("format", f).Msg("unknown output format")
 		}
-		if err := writePrometheusFile(fs, cfg.PromDir, cluster, blocks); err != nil {
-			l.Error().Err(err).Msg("write Prometheus .prom failed")
-		}
-		log.Info().Str("cluster", cluster).Str("prom_dir", cfg.PromDir).Msg("Prometheus .prom written")
 	}
 
 	setPhase("done")
@@ -3028,7 +3032,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						// Try to build it from raw ncc log
 						raw := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
 						if _, err2 := os.Stat(raw); err2 == nil {
-							if err3 := filterBlocksToFile(OSFS{}, raw, filtered); err3 != nil {
+							if _, err3 := filterBlocksToFile(OSFS{}, raw, filtered); err3 != nil {
 								log.Error().Str("cluster", cluster).Err(err3).Msg("replay: build filtered failed")
 								continue
 							}
