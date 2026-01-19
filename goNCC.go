@@ -18,13 +18,16 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/smtp"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -38,7 +41,7 @@ import (
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
-/************** Config **************/
+// ==================== Configuration ====================
 
 type Config struct {
 	Clusters           []string
@@ -51,19 +54,31 @@ type Config struct {
 	PollJitter         time.Duration
 	OutputDirLogs      string
 	OutputDirFiltered  string
-	OutputFormats      []string // html,csv
+	OutputFormats      []string // html,csv,json
 	MaxParallel        int
 	TLSMinVersion      uint16
 	LogFile            string
+
+	// Filtering
+	SeverityFilter []string // Only include these severities (FAIL, WARN, ERR, INFO)
 
 	// Logging options
 	LogLevel string // 0..5 or names
 	LogHTTP  bool   // dump HTTP request/response
 
+	// Dry-run mode
+	DryRun bool // Don't actually run checks, just validate config
+
 	// Retry tuning
 	RetryMaxAttempts int
 	RetryBaseDelay   time.Duration
 	RetryMaxDelay    time.Duration
+
+	// HTTP connection pooling
+	MaxIdleConns        int           // Max idle connections per host
+	MaxIdleConnsPerHost int           // Max idle connections per host
+	MaxConnsPerHost     int           // Max total connections per host
+	IdleConnTimeout     time.Duration // Idle connection timeout
 
 	// Prometheus metrics
 	PromDir string `mapstructure:"prom-dir"`
@@ -82,6 +97,11 @@ type Config struct {
 	WebhookEnabled bool
 	WebhookURL     string
 	WebhookHeaders map[string]string `mapstructure:"webhook-headers"`
+
+	// Slack
+	SlackEnabled    bool
+	SlackWebhookURL string `mapstructure:"slack-webhook-url"`
+	SlackChannel    string `mapstructure:"slack-channel"`
 }
 
 type NotificationSummary struct {
@@ -183,6 +203,44 @@ Disclaimer:
      The developer or Nutanix shall not be held liable for any consequences resulting from its use.
 `
 
+// ==================== Constants ====================
+
+const (
+	// Default values
+	defaultTimeout           = 15 * time.Minute
+	defaultRequestTimeout    = 20 * time.Second
+	defaultPollInterval      = 15 * time.Second
+	defaultPollJitter        = 2 * time.Second
+	defaultMaxParallel       = 4
+	defaultRetryAttempts     = 6
+	defaultRetryBaseDelay    = 400 * time.Millisecond
+	defaultRetryMaxDelay     = 8 * time.Second
+	defaultOutputDirLogs     = "nccfiles"
+	defaultOutputDirFiltered = "outputfiles"
+	defaultPromDir           = "promfiles"
+	defaultLogFile           = "logs/ncc-runner.log"
+	defaultOutputFormat      = "html"
+
+	// HTTP connection pooling defaults
+	defaultMaxIdleConns        = 100
+	defaultMaxIdleConnsPerHost = 10
+	defaultMaxConnsPerHost     = 0 // 0 = unlimited
+	defaultIdleConnTimeout     = 90 * time.Second
+
+	// Graceful shutdown
+	shutdownTimeout = 30 * time.Second
+
+	// Security
+	minPasswordLength = 1
+	maxClusterNameLen = 255
+	maxURLLength      = 2048
+
+	// Prism Gateway port
+	prismGatewayPort = 9440
+)
+
+// ==================== Utility Functions ====================
+
 func splitCSV(s string) []string {
 	if s == "" {
 		return nil
@@ -202,10 +260,236 @@ func mustParseDur(s string, def time.Duration) time.Duration {
 	if s == "" {
 		return def
 	}
-	if d, err := time.ParseDuration(s); err == nil {
-		return d
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return def
 	}
-	return def
+	return d
+}
+
+// ==================== Validation Functions ====================
+
+// validateClusterAddress validates cluster IP or hostname
+func validateClusterAddress(cluster string) error {
+	if cluster == "" {
+		return errors.New("cluster address cannot be empty")
+	}
+	if len(cluster) > maxClusterNameLen {
+		return fmt.Errorf("cluster address too long (max %d chars)", maxClusterNameLen)
+	}
+
+	// Check if it's a valid IP or hostname
+	if net.ParseIP(cluster) != nil {
+		return nil // Valid IP
+	}
+
+	// Validate hostname format (basic check)
+	if strings.Contains(cluster, "..") || strings.HasPrefix(cluster, ".") || strings.HasSuffix(cluster, ".") {
+		return errors.New("invalid cluster hostname format")
+	}
+
+	// Check for valid characters in hostname
+	for _, r := range cluster {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_') {
+			return fmt.Errorf("invalid character in cluster address: %c", r)
+		}
+	}
+
+	return nil
+}
+
+// validateClusters validates all cluster addresses
+func validateClusters(clusters []string) error {
+	if len(clusters) == 0 {
+		return errors.New("at least one cluster must be provided")
+	}
+
+	seen := make(map[string]bool)
+	for i, cluster := range clusters {
+		if err := validateClusterAddress(cluster); err != nil {
+			return fmt.Errorf("cluster %d (%s): %w", i+1, cluster, err)
+		}
+		if seen[cluster] {
+			return fmt.Errorf("duplicate cluster address: %s", cluster)
+		}
+		seen[cluster] = true
+	}
+
+	return nil
+}
+
+// validateURL validates webhook/Slack URLs
+func validateURL(urlStr string) error {
+	if urlStr == "" {
+		return errors.New("URL cannot be empty")
+	}
+	if len(urlStr) > maxURLLength {
+		return fmt.Errorf("URL too long (max %d chars)", maxURLLength)
+	}
+
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		return fmt.Errorf("invalid URL format: %w", err)
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL must use http or https scheme, got: %s", parsed.Scheme)
+	}
+
+	if parsed.Host == "" {
+		return errors.New("URL must have a host")
+	}
+
+	return nil
+}
+
+// validateEmailAddress validates email address format
+func validateEmailAddress(email string) error {
+	if email == "" {
+		return errors.New("email address cannot be empty")
+	}
+
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return errors.New("invalid email format: must contain exactly one @")
+	}
+
+	local, domain := parts[0], parts[1]
+	if len(local) == 0 || len(domain) == 0 {
+		return errors.New("invalid email format: local or domain part is empty")
+	}
+
+	if !strings.Contains(domain, ".") {
+		return errors.New("invalid email format: domain must contain a dot")
+	}
+
+	return nil
+}
+
+// validateConfig performs comprehensive configuration validation
+func validateConfig(cfg Config) error {
+	// Validate clusters
+	if err := validateClusters(cfg.Clusters); err != nil {
+		return fmt.Errorf("cluster validation failed: %w", err)
+	}
+
+	// Validate username
+	if cfg.Username == "" {
+		return errors.New("username cannot be empty")
+	}
+	if len(cfg.Username) > 255 {
+		return errors.New("username too long (max 255 characters)")
+	}
+
+	// Validate timeouts
+	if cfg.Timeout <= 0 {
+		return errors.New("timeout must be greater than 0")
+	}
+	if cfg.RequestTimeout <= 0 {
+		return errors.New("request-timeout must be greater than 0")
+	}
+	if cfg.RequestTimeout > cfg.Timeout {
+		return errors.New("request-timeout cannot be greater than overall timeout")
+	}
+
+	// Validate concurrency
+	if cfg.MaxParallel <= 0 {
+		return errors.New("max-parallel must be greater than 0")
+	}
+	if cfg.MaxParallel > 100 {
+		return errors.New("max-parallel cannot exceed 100 (safety limit)")
+	}
+
+	// Validate output formats
+	validFormats := map[string]bool{"html": true, "csv": true, "json": true}
+	for _, format := range cfg.OutputFormats {
+		if !validFormats[strings.ToLower(format)] {
+			return fmt.Errorf("invalid output format: %s (valid: html, csv, json)", format)
+		}
+	}
+
+	// Validate severity filter
+	validSeverities := map[string]bool{"FAIL": true, "WARN": true, "ERR": true, "INFO": true}
+	for _, sev := range cfg.SeverityFilter {
+		if !validSeverities[strings.ToUpper(sev)] {
+			return fmt.Errorf("invalid severity: %s (valid: FAIL, WARN, ERR, INFO)", sev)
+		}
+	}
+
+	// Validate email settings if enabled
+	if cfg.EmailEnabled {
+		if cfg.SMTPServer == "" {
+			return errors.New("smtp-server is required when email is enabled")
+		}
+		if cfg.EmailFrom == "" {
+			return errors.New("email-from is required when email is enabled")
+		}
+		if len(cfg.EmailTo) == 0 {
+			return errors.New("email-to is required when email is enabled")
+		}
+		if cfg.SMTPPort <= 0 || cfg.SMTPPort > 65535 {
+			return errors.New("smtp-port must be between 1 and 65535")
+		}
+
+		if err := validateEmailAddress(cfg.EmailFrom); err != nil {
+			return fmt.Errorf("invalid email-from: %w", err)
+		}
+		for i, to := range cfg.EmailTo {
+			if err := validateEmailAddress(to); err != nil {
+				return fmt.Errorf("invalid email-to[%d]: %w", i, err)
+			}
+		}
+	}
+
+	// Validate webhook if enabled
+	if cfg.WebhookEnabled {
+		if err := validateURL(cfg.WebhookURL); err != nil {
+			return fmt.Errorf("invalid webhook-url: %w", err)
+		}
+	}
+
+	// Validate Slack if enabled
+	if cfg.SlackEnabled {
+		if err := validateURL(cfg.SlackWebhookURL); err != nil {
+			return fmt.Errorf("invalid slack-webhook-url: %w", err)
+		}
+	}
+
+	// Validate retry settings
+	if cfg.RetryMaxAttempts <= 0 {
+		return errors.New("retry-max-attempts must be greater than 0")
+	}
+	if cfg.RetryMaxAttempts > 50 {
+		return errors.New("retry-max-attempts cannot exceed 50 (safety limit)")
+	}
+	if cfg.RetryBaseDelay <= 0 {
+		return errors.New("retry-base-delay must be greater than 0")
+	}
+	if cfg.RetryMaxDelay <= 0 {
+		return errors.New("retry-max-delay must be greater than 0")
+	}
+	if cfg.RetryBaseDelay > cfg.RetryMaxDelay {
+		return errors.New("retry-base-delay cannot be greater than retry-max-delay")
+	}
+
+	// Security warning for insecure skip verify
+	if cfg.InsecureSkipVerify {
+		log.Warn().Msg("WARNING: TLS verification is disabled. This should only be used in trusted lab environments")
+	}
+
+	return nil
+}
+
+// maskPassword returns a masked version of password for logging
+func maskPassword(pwd string) string {
+	if pwd == "" {
+		return "(empty)"
+	}
+	if len(pwd) <= 4 {
+		return "****"
+	}
+	return pwd[:2] + "****" + pwd[len(pwd)-2:]
 }
 
 func writeDummyConfig(path string) error {
@@ -394,69 +678,85 @@ func bindConfig() (Config, error) {
 	viper.AutomaticEnv()
 
 	cfg := Config{
-		Clusters:           splitCSV(viper.GetString("clusters")),
-		Username:           viper.GetString("username"),
-		Password:           viper.GetString("password"),
-		InsecureSkipVerify: viper.GetBool("insecure-skip-verify"),
-		Timeout:            mustParseDur(viper.GetString("timeout"), 15*time.Minute),
-		RequestTimeout:     mustParseDur(viper.GetString("request-timeout"), 20*time.Second),
-		PollInterval:       mustParseDur(viper.GetString("poll-interval"), 15*time.Second),
-		PollJitter:         mustParseDur(viper.GetString("poll-jitter"), 2*time.Second),
-		OutputDirLogs:      viper.GetString("output-dir-logs"),
-		OutputDirFiltered:  viper.GetString("output-dir-filtered"),
-		OutputFormats:      splitCSV(viper.GetString("outputs")),
-		MaxParallel:        viper.GetInt("max-parallel"),
-		TLSMinVersion:      tls.VersionTLS12,
-		LogFile:            viper.GetString("log-file"),
-		LogLevel:           viper.GetString("log-level"),
-		LogHTTP:            viper.GetBool("log-http"),
-		RetryMaxAttempts:   viper.GetInt("retry-max-attempts"),
-		RetryBaseDelay:     mustParseDur(viper.GetString("retry-base-delay"), 400*time.Millisecond),
-		RetryMaxDelay:      mustParseDur(viper.GetString("retry-max-delay"), 8*time.Second),
-		EmailEnabled:       viper.GetBool("email-enabled"),
-		SMTPServer:         viper.GetString("smtp-server"),
-		SMTPPort:           viper.GetInt("smtp-port"),
-		SMTPUser:           viper.GetString("smtp-user"),
-		SMTPPassword:       viper.GetString("smtp-password"),
-		EmailFrom:          viper.GetString("email-from"),
-		EmailTo:            splitCSV(viper.GetString("email-to")),
-		EmailUseTLS:        viper.GetBool("email-use-tls"),
-		WebhookEnabled:     viper.GetBool("webhook-enabled"),
-		WebhookURL:         viper.GetString("webhook-url"),
-		WebhookHeaders:     viper.GetStringMapString("webhook-headers"),
+		Clusters:            splitCSV(viper.GetString("clusters")),
+		Username:            viper.GetString("username"),
+		Password:            viper.GetString("password"),
+		InsecureSkipVerify:  viper.GetBool("insecure-skip-verify"),
+		Timeout:             mustParseDur(viper.GetString("timeout"), defaultTimeout),
+		RequestTimeout:      mustParseDur(viper.GetString("request-timeout"), defaultRequestTimeout),
+		PollInterval:        mustParseDur(viper.GetString("poll-interval"), defaultPollInterval),
+		PollJitter:          mustParseDur(viper.GetString("poll-jitter"), defaultPollJitter),
+		OutputDirLogs:       viper.GetString("output-dir-logs"),
+		OutputDirFiltered:   viper.GetString("output-dir-filtered"),
+		OutputFormats:       splitCSV(viper.GetString("outputs")),
+		MaxParallel:         viper.GetInt("max-parallel"),
+		TLSMinVersion:       tls.VersionTLS12,
+		LogFile:             viper.GetString("log-file"),
+		LogLevel:            viper.GetString("log-level"),
+		LogHTTP:             viper.GetBool("log-http"),
+		RetryMaxAttempts:    viper.GetInt("retry-max-attempts"),
+		RetryBaseDelay:      mustParseDur(viper.GetString("retry-base-delay"), defaultRetryBaseDelay),
+		RetryMaxDelay:       mustParseDur(viper.GetString("retry-max-delay"), defaultRetryMaxDelay),
+		MaxIdleConns:        viper.GetInt("max-idle-conns"),
+		MaxIdleConnsPerHost: viper.GetInt("max-idle-conns-per-host"),
+		MaxConnsPerHost:     viper.GetInt("max-conns-per-host"),
+		IdleConnTimeout:     mustParseDur(viper.GetString("idle-conn-timeout"), defaultIdleConnTimeout),
+		EmailEnabled:        viper.GetBool("email-enabled"),
+		SMTPServer:          viper.GetString("smtp-server"),
+		SMTPPort:            viper.GetInt("smtp-port"),
+		SMTPUser:            viper.GetString("smtp-user"),
+		SMTPPassword:        viper.GetString("smtp-password"),
+		EmailFrom:           viper.GetString("email-from"),
+		EmailTo:             splitCSV(viper.GetString("email-to")),
+		EmailUseTLS:         viper.GetBool("email-use-tls"),
+		WebhookEnabled:      viper.GetBool("webhook-enabled"),
+		WebhookURL:          viper.GetString("webhook-url"),
+		WebhookHeaders:      viper.GetStringMapString("webhook-headers"),
+		SeverityFilter:      splitCSV(viper.GetString("severity-filter")),
+		DryRun:              viper.GetBool("dry-run"),
+		SlackEnabled:        viper.GetBool("slack-enabled"),
+		SlackWebhookURL:     viper.GetString("slack-webhook-url"),
+		SlackChannel:        viper.GetString("slack-channel"),
 	}
+	// Apply defaults
 	if cfg.OutputDirLogs == "" {
-		cfg.OutputDirLogs = "nccfiles"
+		cfg.OutputDirLogs = defaultOutputDirLogs
 	}
 	if cfg.OutputDirFiltered == "" {
-		cfg.OutputDirFiltered = "outputfiles"
+		cfg.OutputDirFiltered = defaultOutputDirFiltered
 	}
 	if len(cfg.OutputFormats) == 0 {
-		cfg.OutputFormats = []string{"html"}
+		cfg.OutputFormats = []string{defaultOutputFormat}
 	}
 	if cfg.MaxParallel <= 0 {
-		cfg.MaxParallel = 4
+		cfg.MaxParallel = defaultMaxParallel
 	}
 	if cfg.LogFile == "" {
-		cfg.LogFile = "logs/ncc-runner.log"
+		cfg.LogFile = defaultLogFile
 	}
 	cfg.PromDir = viper.GetString("prom-dir")
 	if cfg.PromDir == "" {
-		cfg.PromDir = "promfiles"
+		cfg.PromDir = defaultPromDir
 	}
 	if cfg.RetryMaxAttempts <= 0 {
-		cfg.RetryMaxAttempts = 6
+		cfg.RetryMaxAttempts = defaultRetryAttempts
 	}
 	if cfg.RetryBaseDelay <= 0 {
-		cfg.RetryBaseDelay = 400 * time.Millisecond
+		cfg.RetryBaseDelay = defaultRetryBaseDelay
 	}
 	if cfg.RetryMaxDelay <= 0 {
-		cfg.RetryMaxDelay = 8 * time.Second
+		cfg.RetryMaxDelay = defaultRetryMaxDelay
 	}
+
+	// Validate configuration
+	if err := validateConfig(cfg); err != nil {
+		return cfg, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
 	return cfg, nil
 }
 
-/************** Logging **************/
+// ==================== Logging ====================
 
 // In setupFileLogger, add the new version fields to the global logger context
 func setupFileLogger(logPath string, lvl zerolog.Level) error {
@@ -496,7 +796,7 @@ func setupFileLogger(logPath string, lvl zerolog.Level) error {
 	return nil
 }
 
-/************** Retry helpers **************/
+// ==================== Retry Helpers ====================
 
 func jitteredBackoff(base, maxDelay time.Duration, attempt int) time.Duration {
 	exp := float64(base) * math.Pow(2, float64(attempt-1))
@@ -540,7 +840,7 @@ func retryAfterDelay(resp *http.Response) (time.Duration, bool) {
 	return 0, false
 }
 
-/************** HTTP and FS **************/
+// ==================== HTTP Client and File System ====================
 
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -588,6 +888,20 @@ func (t *LoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 func NewHTTPClient(cfg Config) *http.Client {
+	// Apply defaults for connection pooling
+	maxIdleConns := cfg.MaxIdleConns
+	if maxIdleConns <= 0 {
+		maxIdleConns = defaultMaxIdleConns
+	}
+	maxIdleConnsPerHost := cfg.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+	}
+	idleConnTimeout := cfg.IdleConnTimeout
+	if idleConnTimeout <= 0 {
+		idleConnTimeout = defaultIdleConnTimeout
+	}
+
 	tr := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -600,20 +914,25 @@ func NewHTTPClient(cfg Config) *http.Client {
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
 			MinVersion:         cfg.TLSMinVersion,
 		},
-		IdleConnTimeout: 90 * time.Second,
-		MaxIdleConns:    100,
+		// Production-ready connection pooling
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     cfg.MaxConnsPerHost, // 0 = unlimited
+		IdleConnTimeout:     idleConnTimeout,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true, // Enable HTTP/2 for better performance
 	}
 	rt := http.RoundTripper(tr)
 	if cfg.LogHTTP || os.Getenv("LOG_HTTP") == "1" {
 		rt = &LoggingTransport{Base: tr, MaxBody: 64 * 1024}
 	}
 	return &http.Client{
-		Timeout:   cfg.Timeout, // overall guard
+		Timeout:   cfg.RequestTimeout, // Use request timeout, not overall timeout
 		Transport: rt,
 	}
 }
 
-/************** FS **************/
+// ==================== File System Interface ====================
 
 type FS interface {
 	MkdirAll(path string, perm os.FileMode) error
@@ -633,7 +952,7 @@ func (OSFS) ReadFile(path string) ([]byte, error)       { return os.ReadFile(pat
 func (OSFS) ReadDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
 func (OSFS) Create(path string) (*os.File, error)       { return os.Create(path) }
 
-/************** Prometheus metrics **************/
+// ==================== Prometheus Metrics ====================
 // sanitizeLabel ensures Prometheus label values are safe-ish (no newlines, quotes escaped).
 func sanitizeLabel(s string) string {
 	s = strings.TrimSpace(s)
@@ -710,7 +1029,7 @@ func writePrometheusFile(fs FS, promDir, cluster string, blocks []ParsedBlock) e
 	return fs.WriteFile(filename, []byte(b.String()), 0644)
 }
 
-/************** API Types **************/
+// ==================== API Types ====================
 
 type TaskStatus struct {
 	PercentageComplete int    `json:"percentage_complete"`
@@ -721,7 +1040,7 @@ type NCCSummary struct {
 	RunSummary string `json:"runSummary"`
 }
 
-/************** Parser **************/
+// ==================== Parser ====================
 
 var (
 	reBlockStart = regexp.MustCompile(`^Detailed information for .*`)
@@ -825,7 +1144,7 @@ func parseNCCHeader(path string) (HTMLMeta, error) {
 	return meta, nil
 }
 
-/************** Email-Notify **************/
+// ==================== Email Notifications ====================
 
 func sendEmail(cfg Config, subj string, body string) error {
 	if !cfg.EmailEnabled || cfg.SMTPServer == "" || len(cfg.EmailTo) == 0 {
@@ -879,7 +1198,7 @@ func sendEmail(cfg Config, subj string, body string) error {
 	return smtp.SendMail(addr, auth, cfg.EmailFrom, cfg.EmailTo, msg.Bytes())
 }
 
-/************** Webhook-Notify **************/
+// ==================== Webhook Notifications ====================
 
 func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary NotificationSummary) error {
 	if !cfg.WebhookEnabled || cfg.WebhookURL == "" {
@@ -941,7 +1260,89 @@ func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary Not
 	return fmt.Errorf("webhook exhausted retries")
 }
 
-/************** Renderers **************/
+// ==================== Slack Notifications ====================
+
+func sendSlack(ctx context.Context, client HTTPClient, cfg Config, summary NotificationSummary) error {
+	if !cfg.SlackEnabled || cfg.SlackWebhookURL == "" {
+		return nil
+	}
+
+	// Determine color based on severity
+	color := "#36a64f" // green
+	if summary.FailCount > 0 {
+		color = "#ff0000" // red
+	} else if summary.WarnCount > 0 {
+		color = "#ffaa00" // orange
+	}
+
+	// Build Slack message
+	attachment := map[string]interface{}{
+		"color": color,
+		"title": fmt.Sprintf("NCC Report: %s", summary.Cluster),
+		"fields": []map[string]string{
+			{"title": "FAIL", "value": fmt.Sprintf("%d", summary.FailCount), "short": "true"},
+			{"title": "WARN", "value": fmt.Sprintf("%d", summary.WarnCount), "short": "true"},
+			{"title": "ERR", "value": fmt.Sprintf("%d", summary.ErrCount), "short": "true"},
+			{"title": "INFO", "value": fmt.Sprintf("%d", summary.InfoCount), "short": "true"},
+			{"title": "Total Checks", "value": fmt.Sprintf("%d", summary.TotalChecks), "short": "false"},
+		},
+		"footer": "NCC Orchestrator",
+		"ts":     summary.FinishedAt.Unix(),
+	}
+
+	payload := map[string]interface{}{
+		"attachments": []map[string]interface{}{attachment},
+	}
+
+	if cfg.SlackChannel != "" {
+		payload["channel"] = cfg.SlackChannel
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal slack payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.SlackWebhookURL, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Simple retry loop
+	for attempt := 1; attempt <= cfg.RetryMaxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == cfg.RetryMaxAttempts {
+				return fmt.Errorf("slack request failed: %w", err)
+			}
+		} else {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			if !isRetryableStatus(resp.StatusCode) || attempt == cfg.RetryMaxAttempts {
+				return fmt.Errorf("slack status %d", resp.StatusCode)
+			}
+		}
+		backoff := jitteredBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, attempt)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return fmt.Errorf("slack exhausted retries")
+}
+
+// ==================== Report Renderers ====================
 
 // func generateHTMLNoMeta(fs FS, rows []Row, filename string) error {
 // 	return generateHTML(fs, rows, filename, HTMLMeta{})
@@ -1120,6 +1521,80 @@ func generateCSV(fs FS, blocks []ParsedBlock, filename string) error {
 	return w.Error()
 }
 
+type JSONOutput struct {
+	GeneratedAt string      `json:"generated_at"`
+	Checks      []JSONCheck `json:"checks"`
+	Summary     JSONSummary `json:"summary"`
+}
+
+type JSONCheck struct {
+	Severity  string `json:"severity"`
+	CheckName string `json:"check_name"`
+	Detail    string `json:"detail"`
+}
+
+type JSONSummary struct {
+	Total int            `json:"total"`
+	Count map[string]int `json:"count"`
+}
+
+func generateJSON(fs FS, blocks []ParsedBlock, filename string, meta HTMLMeta) error {
+	f, err := fs.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
+	checks := make([]JSONCheck, 0, len(blocks))
+	for _, b := range blocks {
+		sev := b.Severity
+		if sev == "" {
+			sev = "INFO"
+		}
+		counts[sev]++
+		checks = append(checks, JSONCheck{
+			Severity:  sev,
+			CheckName: b.CheckName,
+			Detail:    b.DetailRaw,
+		})
+	}
+
+	output := JSONOutput{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Checks:      checks,
+		Summary: JSONSummary{
+			Total: len(blocks),
+			Count: counts,
+		},
+	}
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(output)
+}
+
+func filterBlocksBySeverity(blocks []ParsedBlock, allowedSeverities []string) []ParsedBlock {
+	if len(allowedSeverities) == 0 {
+		return blocks
+	}
+	allowed := make(map[string]bool)
+	for _, s := range allowedSeverities {
+		allowed[strings.ToUpper(strings.TrimSpace(s))] = true
+	}
+	filtered := make([]ParsedBlock, 0, len(blocks))
+	for _, b := range blocks {
+		sev := b.Severity
+		if sev == "" {
+			sev = "INFO"
+		}
+		if allowed[sev] {
+			filtered = append(filtered, b)
+		}
+	}
+	return filtered
+}
+
 func rowsFromBlocks(blocks []ParsedBlock) []Row {
 	rows := make([]Row, 0, len(blocks))
 	for _, b := range blocks {
@@ -1133,7 +1608,7 @@ func rowsFromBlocks(blocks []ParsedBlock) []Row {
 	return rows
 }
 
-/************** Aggregation **************/
+// ==================== Aggregation ====================
 
 type AggBlock struct {
 	Cluster        string
@@ -2410,7 +2885,7 @@ function initTooltips() {
 	return nil
 }
 
-/************** Retryable HTTP wrappers **************/
+// ==================== Retryable HTTP Wrappers ====================
 
 func doWithRetry(ctx context.Context, client HTTPClient, req *http.Request, cfg Config, op string) (*http.Response, []byte, error) {
 	attempts := cfg.RetryMaxAttempts
@@ -2523,7 +2998,7 @@ func doWithRetry(ctx context.Context, client HTTPClient, req *http.Request, cfg 
 	return resp, body, fmt.Errorf("%s exhausted retries", op)
 }
 
-/************** NCC Client **************/
+// ==================== NCC Client ====================
 
 type NCCClient struct {
 	baseURL string
@@ -2627,7 +3102,7 @@ func (c *NCCClient) GetRunSummary(ctx context.Context, taskID string) (NCCSummar
 	return summary, body, nil
 }
 
-/************** Orchestration with bars **************/
+// ==================== Orchestration ====================
 
 func sanitizeSummary(s string) string {
 	return strings.ReplaceAll(s, "\\n", "\n")
@@ -2699,8 +3174,8 @@ func runClusterWithBars(
 	for {
 		select {
 		case <-ctx.Done():
-			l.Error().Err(ctx.Err()).Msg("context done during polling")
-			return nil, ctx.Err()
+			l.Warn().Err(ctx.Err()).Msg("context cancelled during polling, stopping gracefully")
+			return nil, fmt.Errorf("operation cancelled: %w", ctx.Err())
 		case <-time.After(cfg.PollInterval + time.Duration(rand.Int63n(int64(cfg.PollJitter)))):
 			if dl, ok := ctx.Deadline(); ok {
 				rem := time.Until(dl)
@@ -2757,6 +3232,14 @@ SUMMARY:
 		return nil, err
 	}
 	l.Info().Str("filteredPath", filteredPath).Msg("filtered written")
+
+	// Apply severity filtering if configured
+	if len(cfg.SeverityFilter) > 0 {
+		originalCount := len(blocks)
+		blocks = filterBlocksBySeverity(blocks, cfg.SeverityFilter)
+		l.Info().Int("original", originalCount).Int("filtered", len(blocks)).Strs("severities", cfg.SeverityFilter).Msg("applied severity filter")
+	}
+
 	counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
 	for _, b := range blocks {
 		sev := b.Severity
@@ -2787,6 +3270,9 @@ SUMMARY:
 	}
 	if err := sendWebhook(ctx, httpc, cfg, summaryNotify); err != nil {
 		l.Error().Err(err).Msg("webhook failed")
+	}
+	if err := sendSlack(ctx, httpc, cfg, summaryNotify); err != nil {
+		l.Error().Err(err).Msg("slack notification failed")
 	}
 	l.Info().Int("fail", summaryNotify.FailCount).Int("warn", summaryNotify.WarnCount).Msg("notifications sent")
 
@@ -2821,6 +3307,15 @@ SUMMARY:
 				return nil, err
 			}
 			l.Info().Str("file", csvFile).Msg("CSV generated")
+		case "json":
+			jsonFile := base + ".json"
+			rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+			meta, _ := parseNCCHeader(rawPath) // ignore error if file missing
+			if err := generateJSON(fs, blocks, jsonFile, meta); err != nil {
+				l.Error().Err(err).Str("file", jsonFile).Msg("write JSON failed")
+				return nil, err
+			}
+			l.Info().Str("file", jsonFile).Msg("JSON generated")
 		default:
 			l.Warn().Str("format", f).Msg("unknown output format")
 		}
@@ -2830,7 +3325,7 @@ SUMMARY:
 	return blocks, nil
 }
 
-/************** CLI **************/
+// ==================== CLI ====================
 
 type ClusterResult struct {
 	Cluster string
@@ -2868,7 +3363,7 @@ var (
 func init() {
 	// Defaults
 	if Version == "" {
-		Version = "0.1.10"
+		Version = "0.1.11"
 	}
 	if BuildDate == "" {
 		BuildDate = "unknown"
@@ -2940,6 +3435,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 			log.Info().
 				Strs("clusters", cfg.Clusters).
 				Str("username", cfg.Username).
+				Str("password", maskPassword(cfg.Password)).
 				Bool("insecureSkipVerify", cfg.InsecureSkipVerify).
 				Dur("timeout", cfg.Timeout).
 				Dur("requestTimeout", cfg.RequestTimeout).
@@ -2961,11 +3457,34 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				fmt.Print(termsText)
 				return nil
 			}
+			// Validate required fields first
 			if len(cfg.Clusters) == 0 {
 				return errors.New("no clusters provided (--clusters, env, or config)")
 			}
 			if cfg.Username == "" {
 				return errors.New("missing --username or config username")
+			}
+
+			// Dry-run mode: perform full validation and exit
+			if cfg.DryRun {
+				// Perform comprehensive validation for dry-run
+				if err := validateConfig(cfg); err != nil {
+					return fmt.Errorf("dry-run validation failed: %w", err)
+				}
+
+				log.Info().Msg("DRY-RUN MODE: Configuration validated, no checks will be executed")
+				fmt.Println("✓ Configuration is valid")
+				fmt.Printf("  Clusters: %d configured\n", len(cfg.Clusters))
+				fmt.Printf("  Username: %s\n", cfg.Username)
+				fmt.Printf("  Output formats: %v\n", cfg.OutputFormats)
+				if len(cfg.SeverityFilter) > 0 {
+					fmt.Printf("  Severity filter: %v\n", cfg.SeverityFilter)
+				}
+				if cfg.InsecureSkipVerify {
+					fmt.Println("  ⚠️  WARNING: TLS verification is disabled")
+				}
+				fmt.Println("  All settings validated successfully")
+				return nil
 			}
 
 			if envInfo, err := cmd.Flags().GetBool("env-info"); err == nil && envInfo {
@@ -2995,7 +3514,12 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 					envVar := "NCC_" + key
 					val := os.Getenv(envVar)
 					if val != "" {
-						fmt.Printf("%s = %s\n", envVar, val)
+						// Mask sensitive values
+						if key == "PASSWORD" || key == "SMTP_PASSWORD" {
+							fmt.Printf("%s = %s\n", envVar, maskPassword(val))
+						} else {
+							fmt.Printf("%s = %s\n", envVar, val)
+						}
 					} else {
 						fmt.Printf("%s = (not set)\n", envVar)
 					}
@@ -3154,9 +3678,38 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 			// Inside RunE, after setting up cfg, fs, httpc...
 			fmt.Println("You have accepted T&C, Check using --tc flag")
 
-			p := mpb.New(mpb.WithWidth(80)) // Removed invalid WithDebug
+			// Create root context with graceful shutdown support
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-			ctx := context.Background()
+			// Setup graceful shutdown signal handling
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+			go func() {
+				sig := <-sigChan
+				log.Warn().Str("signal", sig.String()).Msg("received shutdown signal, initiating graceful shutdown")
+				fmt.Fprintf(os.Stderr, "\n⚠️  Received %s signal. Initiating graceful shutdown...\n", sig.String())
+				cancel() // Cancel root context to stop all operations
+
+				// Give operations time to finish
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer shutdownCancel()
+
+				select {
+				case <-shutdownCtx.Done():
+					log.Warn().Msg("graceful shutdown timeout exceeded, forcing exit")
+					fmt.Fprintln(os.Stderr, "⚠️  Graceful shutdown timeout exceeded")
+					os.Exit(1)
+				case <-time.After(100 * time.Millisecond):
+					// Allow time for cleanup
+				}
+			}()
+
+			p := mpb.New(mpb.WithWidth(80))
+			defer func() {
+				// Ensure progress bars are cleaned up on exit
+				p.Wait()
+			}()
 			sem := make(chan struct{}, cfg.MaxParallel)
 			var wg sync.WaitGroup
 			results := make(chan ClusterResult, len(cfg.Clusters))
@@ -3232,8 +3785,33 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				}(cluster, mainBar, phaseProxy, phaseBar) // Pass phaseBar
 			}
 
-			// Wait for workers, close and drain results
-			wg.Wait()
+			// Wait for workers with context cancellation support
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// All workers completed normally
+			case <-ctx.Done():
+				// Context cancelled (shutdown signal received)
+				log.Warn().Msg("context cancelled, waiting for workers to finish")
+				fmt.Fprintln(os.Stderr, "⏳ Waiting for in-progress operations to complete...")
+				// Wait with timeout for workers to finish
+				waitCtx, waitCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer waitCancel()
+				select {
+				case <-done:
+					log.Info().Msg("all workers completed after cancellation")
+				case <-waitCtx.Done():
+					log.Error().Msg("timeout waiting for workers after cancellation")
+					fmt.Fprintln(os.Stderr, "❌ Timeout waiting for operations to complete")
+					return fmt.Errorf("graceful shutdown timeout: operations did not complete in time")
+				}
+			}
+
 			close(results)
 
 			var failed []string
@@ -3275,14 +3853,18 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				log.Error().Err(err).Msg("write aggregated HTML failed")
 			}
 
-			// // Flush progress rendering
-			// log.Info().Msg("Before p.Wait()") // Temporary debug log
-			// p.Wait()
-			// log.Info().Msg("After p.Wait()") // Temporary debug log
+			// Check if context was cancelled during execution
+			if ctx.Err() != nil {
+				log.Warn().Err(ctx.Err()).Msg("operation cancelled during execution")
+				if len(failed) > 0 {
+					return fmt.Errorf("operation cancelled: %d clusters failed: %v", len(failed), failed)
+				}
+				return fmt.Errorf("operation cancelled: %w", ctx.Err())
+			}
 
 			if len(failed) > 0 {
 				log.Error().Strs("failedClusters", failed).Msg("some clusters failed")
-				return fmt.Errorf("some clusters failed: %v", failed) // Use this for the message; remove fmt.Printf
+				return fmt.Errorf("some clusters failed: %v", failed)
 			}
 
 			log.Info().Msg("all clusters processed successfully")
@@ -3306,9 +3888,11 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().String("poll-interval", "15s", "Polling interval for task status")
 	cmd.Flags().String("poll-jitter", "2s", "Additive jitter to polling interval")
 	cmd.Flags().Int("max-parallel", 4, "Max concurrent clusters")
-	cmd.Flags().String("outputs", "html,csv", "Comma-separated outputs: html,csv for per-cluster files")
+	cmd.Flags().String("outputs", "html,csv", "Comma-separated outputs: html,csv,json for per-cluster files")
 	cmd.Flags().String("output-dir-logs", "nccfiles", "Directory for raw logs")
 	cmd.Flags().String("output-dir-filtered", "outputfiles", "Directory for filtered and aggregated results")
+	cmd.Flags().String("severity-filter", "", "Comma-separated severities to include (FAIL,WARN,ERR,INFO). Empty = all")
+	cmd.Flags().Bool("dry-run", false, "Validate configuration without running checks")
 	cmd.Flags().String("log-file", "logs/ncc-runner.log", "Path to log file (rotated)")
 	cmd.Flags().String("log-level", "", "Log level (trace/debug/info/warn/error or 0..5)")
 	cmd.Flags().Bool("log-http", false, "Enable HTTP request/response dump logs")
@@ -3328,6 +3912,9 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().Bool("webhook-enabled", false, "Enable webhook notifications")
 	cmd.Flags().String("webhook-url", "", "Webhook endpoint URL")
 	cmd.Flags().StringToString("webhook-headers", map[string]string{}, "Webhook headers (key=value)")
+	cmd.Flags().Bool("slack-enabled", false, "Enable Slack notifications")
+	cmd.Flags().String("slack-webhook-url", "", "Slack webhook URL")
+	cmd.Flags().String("slack-channel", "", "Slack channel (optional, uses webhook default if empty)")
 
 	// viper bindings
 	_ = viper.BindPFlag("config", cmd.Flags().Lookup("config"))
@@ -3362,6 +3949,11 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	_ = viper.BindPFlag("webhook-enabled", cmd.Flags().Lookup("webhook-enabled"))
 	_ = viper.BindPFlag("webhook-url", cmd.Flags().Lookup("webhook-url"))
 	_ = viper.BindPFlag("webhook-headers", cmd.Flags().Lookup("webhook-headers"))
+	_ = viper.BindPFlag("severity-filter", cmd.Flags().Lookup("severity-filter"))
+	_ = viper.BindPFlag("dry-run", cmd.Flags().Lookup("dry-run"))
+	_ = viper.BindPFlag("slack-enabled", cmd.Flags().Lookup("slack-enabled"))
+	_ = viper.BindPFlag("slack-webhook-url", cmd.Flags().Lookup("slack-webhook-url"))
+	_ = viper.BindPFlag("slack-channel", cmd.Flags().Lookup("slack-channel"))
 
 	return cmd
 }
