@@ -1741,3 +1741,296 @@ func TestBindConfigAllFlags(t *testing.T) {
 		t.Error("SlackEnabled not set correctly")
 	}
 }
+
+// ==================== Validation and Helpers ====================
+
+func TestValidateClusterAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		cluster string
+		wantErr bool
+	}{
+		{"Valid IPv4", "10.0.1.1", false},
+		{"Valid IPv4 another", "192.168.0.1", false},
+		{"Valid hostname", "prism.example.com", false},
+		{"Valid hostname with hyphen", "prism-element-01", false},
+		{"Empty", "", true},
+		{"Double dot", "10.0..1", true},
+		{"Leading dot", ".host", true},
+		{"Trailing dot", "host.", true},
+		{"Invalid character space", "10.0.1 1", true},
+		{"Invalid character at", "host@name", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateClusterAddress(tt.cluster)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateClusterAddress(%q) err = %v, wantErr %v", tt.cluster, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateClusters(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		err := validateClusters(nil)
+		if err == nil {
+			t.Error("expected error for nil clusters")
+		}
+		if err := validateClusters([]string{}); err == nil {
+			t.Error("expected error for empty clusters")
+		}
+	})
+	t.Run("Duplicate", func(t *testing.T) {
+		err := validateClusters([]string{"10.0.1.1", "10.0.1.1"})
+		if err == nil {
+			t.Error("expected error for duplicate cluster")
+		}
+		if err != nil && !strings.Contains(err.Error(), "duplicate") {
+			t.Errorf("expected duplicate message, got %v", err)
+		}
+	})
+	t.Run("Valid single", func(t *testing.T) {
+		if err := validateClusters([]string{"10.0.1.1"}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+	t.Run("Invalid address", func(t *testing.T) {
+		err := validateClusters([]string{"bad..host"})
+		if err == nil {
+			t.Error("expected error for invalid address")
+		}
+	})
+}
+
+func TestValidateURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		urlStr string
+		wantOk bool
+	}{
+		{"Valid https", "https://hooks.example.com/ncc", true},
+		{"Valid http", "http://localhost:8080", true},
+		{"Empty", "", false},
+		{"No scheme", "hooks.example.com", false},
+		{"Invalid scheme", "ftp://example.com", false},
+		{"No host", "https://", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateURL(tt.urlStr)
+			if (err == nil) != tt.wantOk {
+				t.Errorf("validateURL(%q) err = %v, wantOk %v", tt.urlStr, err, tt.wantOk)
+			}
+		})
+	}
+}
+
+func TestValidateEmailAddress(t *testing.T) {
+	tests := []struct {
+		name   string
+		email  string
+		wantOk bool
+	}{
+		{"Valid", "user@example.com", true},
+		{"Valid with subdomain", "ncc@mail.example.com", true},
+		{"Empty", "", false},
+		{"No at", "userexample.com", false},
+		{"Two at", "user@name@example.com", false},
+		{"No domain dot", "user@nodot", false},
+		{"Empty local", "@example.com", false},
+		{"Empty domain", "user@", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateEmailAddress(tt.email)
+			if (err == nil) != tt.wantOk {
+				t.Errorf("validateEmailAddress(%q) err = %v, wantOk %v", tt.email, err, tt.wantOk)
+			}
+		})
+	}
+}
+
+func TestValidateConfig(t *testing.T) {
+	t.Run("Valid minimal", func(t *testing.T) {
+		cfg := Config{
+			Clusters:         []string{"10.0.1.1"},
+			Username:         "admin",
+			Timeout:          15 * time.Minute,
+			RequestTimeout:   20 * time.Second,
+			MaxParallel:      4,
+			RetryMaxAttempts: 6,
+			RetryBaseDelay:   400 * time.Millisecond,
+			RetryMaxDelay:    8 * time.Second,
+			OutputFormats:    []string{"html"},
+		}
+		if err := validateConfig(cfg); err != nil {
+			t.Errorf("validateConfig: %v", err)
+		}
+	})
+	t.Run("Empty clusters", func(t *testing.T) {
+		cfg := Config{Username: "admin", Timeout: time.Minute, RequestTimeout: time.Second, MaxParallel: 1, RetryMaxAttempts: 1}
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for empty clusters")
+		}
+	})
+	t.Run("Empty username", func(t *testing.T) {
+		cfg := Config{Clusters: []string{"10.0.1.1"}, Timeout: time.Minute, RequestTimeout: time.Second, MaxParallel: 1, RetryMaxAttempts: 1}
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for empty username")
+		}
+	})
+	t.Run("Zero timeout", func(t *testing.T) {
+		cfg := Config{Clusters: []string{"10.0.1.1"}, Username: "u", Timeout: 0, RequestTimeout: time.Second, MaxParallel: 1, RetryMaxAttempts: 1}
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for zero timeout")
+		}
+	})
+}
+
+func TestMaskPassword(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"Empty", "", "(empty)"},
+		{"Short 1", "a", "****"},
+		{"Short 4", "abcd", "****"},
+		{"Long", "password123", "pa****23"},
+		{"Exact 5", "abcde", "ab****de"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := maskPassword(tt.in)
+			if got != tt.want {
+				t.Errorf("maskPassword(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseNCCHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "header.log")
+	content := `Cluster Name: my-cluster
+Cluster Version: 6.5.2
+NCC Version: 4.2.0
+Some other line
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := parseNCCHeader(path)
+	if err != nil {
+		t.Fatalf("parseNCCHeader: %v", err)
+	}
+	if meta.ClusterName != "my-cluster" {
+		t.Errorf("ClusterName = %q, want my-cluster", meta.ClusterName)
+	}
+	if meta.ClusterVersion != "6.5.2" {
+		t.Errorf("ClusterVersion = %q, want 6.5.2", meta.ClusterVersion)
+	}
+	if meta.NCCVersion != "4.2.0" {
+		t.Errorf("NCCVersion = %q, want 4.2.0", meta.NCCVersion)
+	}
+}
+
+func TestParseNCCHeaderMissing(t *testing.T) {
+	_, err := parseNCCHeader(filepath.Join(t.TempDir(), "nonexistent.log"))
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestRowsFromBlocks(t *testing.T) {
+	blocks := []ParsedBlock{
+		{Severity: "FAIL", CheckName: "Check One", DetailRaw: "Detail line 1\nLine 2"},
+		{Severity: "WARN", CheckName: "Check Two", DetailRaw: "Detail"},
+	}
+	rows := rowsFromBlocks(blocks)
+	if len(rows) != 2 {
+		t.Fatalf("len(rows) = %d, want 2", len(rows))
+	}
+	if rows[0].Severity != "FAIL" || rows[0].CheckName != "Check One" {
+		t.Errorf("row[0]: severity=%q checkName=%q", rows[0].Severity, rows[0].CheckName)
+	}
+	if rows[1].Severity != "WARN" || rows[1].CheckName != "Check Two" {
+		t.Errorf("row[1]: severity=%q checkName=%q", rows[1].Severity, rows[1].CheckName)
+	}
+	if !strings.Contains(string(rows[0].Detail), "Detail line 1") {
+		t.Errorf("row[0].Detail should contain escaped content")
+	}
+}
+
+func TestRowsFromBlocksEmpty(t *testing.T) {
+	rows := rowsFromBlocks(nil)
+	if len(rows) != 0 {
+		t.Errorf("len(rows) = %d, want 0", len(rows))
+	}
+}
+
+func TestSanitizeSummary(t *testing.T) {
+	got := sanitizeSummary("line1\\nline2")
+	if got != "line1\nline2" {
+		t.Errorf("sanitizeSummary = %q, want line1\\nline2 with real newline", got)
+	}
+	got = sanitizeSummary("no backslash n")
+	if got != "no backslash n" {
+		t.Errorf("sanitizeSummary = %q", got)
+	}
+}
+
+func TestGenerateTestAgg(t *testing.T) {
+	dir := t.TempDir()
+	if err := generateTestAgg(5, dir); err != nil {
+		t.Fatalf("generateTestAgg(5): %v", err)
+	}
+	indexPath := filepath.Join(dir, "index.html")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile index.html: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "const AGG = ") {
+		t.Error("index.html should contain AGG data")
+	}
+	if !strings.Contains(content, "cluster-001") {
+		t.Error("index.html should contain cluster-001")
+	}
+	if !strings.Contains(content, "CLUSTER_LINKS") {
+		t.Error("index.html should contain CLUSTER_LINKS")
+	}
+}
+
+func TestGenerateTestAggZeroClusters(t *testing.T) {
+	dir := t.TempDir()
+	if err := generateTestAgg(0, dir); err != nil {
+		t.Fatalf("generateTestAgg(0) should not error: %v", err)
+	}
+	indexPath := filepath.Join(dir, "index.html")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), "AGG = []") {
+		t.Error("expected AGG = [] for 0 clusters")
+	}
+}
+
+func TestRetryAfterDelay(t *testing.T) {
+	dur, ok := retryAfterDelay(nil)
+	if ok || dur != 0 {
+		t.Errorf("retryAfterDelay(nil) = %v, %v; want 0, false", dur, ok)
+	}
+	resp := &http.Response{Header: http.Header{}}
+	dur, ok = retryAfterDelay(resp)
+	if ok || dur != 0 {
+		t.Errorf("no Retry-After: want 0, false; got %v, %v", dur, ok)
+	}
+	resp.Header.Set("Retry-After", "30")
+	dur, ok = retryAfterDelay(resp)
+	if !ok || dur != 30*time.Second {
+		t.Errorf("Retry-After 30: want 30s, true; got %v, %v", dur, ok)
+	}
+}
