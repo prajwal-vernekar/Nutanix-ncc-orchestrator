@@ -1069,7 +1069,7 @@ func BenchmarkSanitizeLabel(b *testing.B) {
 // setMinimalValidConfig sets clusters and username so bindConfig() validation passes.
 func setMinimalValidConfig() {
 	viper.Set("clusters", "10.0.0.1")
-	viper.Set("username", "testuser")
+	viper.Set("username", "admin")
 }
 
 func TestBindConfigDefaults(t *testing.T) {

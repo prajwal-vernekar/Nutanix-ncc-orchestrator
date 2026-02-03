@@ -123,9 +123,15 @@ type HTMLMeta struct {
 }
 
 type HTMLData struct {
-	Rows []Row
-	Now  string
-	Meta HTMLMeta
+	Rows    []Row
+	Now     string
+	Meta    HTMLMeta
+	Summary SummaryCounts
+}
+
+// SummaryCounts holds per-severity counts for the report header.
+type SummaryCounts struct {
+	FAIL, WARN, ERR, INFO int
 }
 
 const termsText = `
@@ -1349,11 +1355,16 @@ func sendSlack(ctx context.Context, client HTTPClient, cfg Config, summary Notif
 // }
 
 func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
-	const tmpl = `
-<html>
+	if err := fs.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return err
+	}
+	const tmpl = `<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NCC Report - {{.Meta.ClusterName}}</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
   <style>
     :root {
       --fail: #ef4444;
@@ -1364,9 +1375,37 @@ func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
       --thead: #f3f4f6;
     }
     * { box-sizing: border-box; }
-    body { margin: 16px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color: #111827; }
-    h1 { margin: 0 0 8px 0; font-size: 20px; }
-    .meta { color: #6b7280; font-size: 12px; margin-bottom: 12px; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #111827;
+      background: #f9fafb;
+    }
+    .page { max-width: 1100px; margin: 24px auto; padding: 0 16px 24px; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 16px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 22px; }
+    .subtitle { margin-top: 4px; font-size: 13px; color: #6b7280; }
+    .summary-line { font-size: 13px; color: #6b7280; margin-top: 6px; }
+    .summary-line strong { color: #111827; }
+    .tags { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .tag {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+      display: inline-flex;
+      gap: 4px;
+    }
+    .tag .label { color: #6b7280; }
+    .tag .value { font-weight: 600; color: #111827; }
     table { border-collapse: collapse; width: 100%; border: 1px solid var(--border); }
     thead th {
       position: sticky; top: 0; background: var(--thead);
@@ -1381,59 +1420,6 @@ func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
     .sev.INFO { color: #fff; background: var(--info); }
     .sev.ERR  { color: #111827; background: #e5e7eb; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
-
-	body {
-  margin: 0;
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  color: #111827;
-  background: #f9fafb;
-}
-.page {
-  max-width: 1100px;
-  margin: 24px auto;
-  padding: 0 16px 24px;
-}
-.header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-h1 {
-  margin: 0;
-  font-size: 22px;
-}
-.subtitle {
-  margin-top: 4px;
-  font-size: 13px;
-  color: #6b7280;
-}
-.tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: flex-end;
-}
-.tag {
-  background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 999px;
-  padding: 4px 10px;
-  font-size: 11px;
-  display: inline-flex;
-  gap: 4px;
-}
-.tag .label {
-  color: #6b7280;
-}
-.tag .value {
-  font-weight: 600;
-  color: #111827;
-}
-
-/* keep your existing table / sev / mono styles */
-
   </style>
 </head>
 <body>
@@ -1442,50 +1428,39 @@ h1 {
       <div>
         <h1>NCC Report</h1>
         <div class="subtitle">{{.Meta.ClusterName}}</div>
+        <div class="summary-line">
+          {{.Summary.FAIL}} FAIL, {{.Summary.WARN}} WARN, {{.Summary.ERR}} ERR, {{.Summary.INFO}} INFO
+        </div>
       </div>
       <div class="tags">
-        <div class="tag">
-          <span class="label">Cluster</span>
-          <span class="value">{{.Meta.ClusterName}}</span>
-        </div>
-        <div class="tag">
-          <span class="label">Cluster Version</span>
-          <span class="value">{{.Meta.ClusterVersion}}</span>
-        </div>
-        <div class="tag">
-          <span class="label">NCC Version</span>
-          <span class="value">{{.Meta.NCCVersion}}</span>
-        </div>
-        <div class="tag">
-          <span class="label">Generated</span>
-          <span class="value">{{.Now}}</span>
-        </div>
+        <div class="tag"><span class="label">Cluster</span><span class="value">{{.Meta.ClusterName}}</span></div>
+        <div class="tag"><span class="label">Cluster Version</span><span class="value">{{.Meta.ClusterVersion}}</span></div>
+        <div class="tag"><span class="label">NCC Version</span><span class="value">{{.Meta.NCCVersion}}</span></div>
+        <div class="tag"><span class="label">Generated</span><span class="value">{{.Now}}</span></div>
       </div>
     </header>
-
     <main>
       <table>
         <thead>
-        <tr>
-          <th style="width:110px">Severity</th>
-          <th style="width:320px">NCC Check Name</th>
-          <th>Detail Information</th>
-        </tr>
+          <tr>
+            <th style="width:110px">Severity</th>
+            <th style="width:320px">NCC Check Name</th>
+            <th>Detail Information</th>
+          </tr>
         </thead>
         <tbody>
         {{range .Rows}}
-        <tr>
-          <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
-          <td class="mono">{{.CheckName}}</td>
-          <td class="mono">{{.Detail}}</td>
-        </tr>
+          <tr>
+            <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
+            <td class="mono">{{.CheckName}}</td>
+            <td class="mono">{{.Detail}}</td>
+          </tr>
         {{end}}
         </tbody>
       </table>
     </main>
   </div>
 </body>
-
 </html>`
 	f, err := fs.Create(filename)
 	if err != nil {
@@ -1493,10 +1468,24 @@ h1 {
 	}
 	defer f.Close()
 
+	sum := SummaryCounts{}
+	for _, r := range rows {
+		switch r.Severity {
+		case "FAIL":
+			sum.FAIL++
+		case "WARN":
+			sum.WARN++
+		case "ERR":
+			sum.ERR++
+		default:
+			sum.INFO++
+		}
+	}
 	data := HTMLData{
-		Rows: rows,
-		Now:  time.Now().Format(time.RFC3339),
-		Meta: meta,
+		Rows:    rows,
+		Now:     time.Now().Format(time.RFC3339),
+		Meta:    meta,
+		Summary: sum,
 	}
 	t := template.Must(template.New("table").Parse(tmpl))
 	return t.Execute(f, data)
@@ -1613,6 +1602,48 @@ func rowsFromBlocks(blocks []ParsedBlock) []Row {
 
 // ==================== Aggregation ====================
 
+// generateTestAgg produces a test index.html with n clusters and ~10–15 rows per cluster for scalability testing.
+func generateTestAgg(n int, outDir string) error {
+	severities := []string{"FAIL", "WARN", "ERR", "INFO"}
+	checks := []string{
+		"AHV host time sync", "CVM memory", "Disk health", "Network connectivity",
+		"Storage pool", "Prism connectivity", "NCC version", "Cluster health",
+		"Data resilience", "VM placement", "Controller VM", "License validity",
+	}
+	agg := make([]AggBlock, 0, n*12)
+	clusterFiles := make([]struct{ Cluster, HTML, CSV string }, 0, n)
+	for i := 1; i <= n; i++ {
+		cluster := fmt.Sprintf("10.0.%d.%d", (i-1)/255, (i-1)%255+1)
+		clusterName := fmt.Sprintf("cluster-%03d", i)
+		clusterVersion := "6.5.2"
+		nccVersion := "4.2.0"
+		clusterFiles = append(clusterFiles, struct{ Cluster, HTML, CSV string }{
+			Cluster: cluster,
+			HTML:    cluster + ".html",
+			CSV:     cluster + ".csv",
+		})
+		numChecks := 8 + (i % 8)
+		for j := 0; j < numChecks; j++ {
+			sev := severities[(i+j)%len(severities)]
+			check := checks[j%len(checks)]
+			agg = append(agg, AggBlock{
+				Cluster:        cluster,
+				Severity:       sev,
+				Check:          check,
+				Detail:         fmt.Sprintf("Test detail for %s on %s. See https://portal.nutanix.com/kb/%d for more.", check, clusterName, 1000+i+j),
+				ClusterName:    clusterName,
+				ClusterVersion: clusterVersion,
+				NCCVersion:     nccVersion,
+			})
+		}
+	}
+	fs := OSFS{}
+	if err := writeAggregatedHTMLSingle(fs, outDir, agg, clusterFiles); err != nil {
+		return err
+	}
+	return nil
+}
+
 type AggBlock struct {
 	Cluster        string
 	Severity       string
@@ -1629,13 +1660,13 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	}
 	path := filepath.Join(outDir, "index.html")
 	abs, _ := filepath.Abs(path)
-	const tmpl = `
-	<html>
-	<head>
+	const tmpl = `<!DOCTYPE html>
+<html lang="en">
+<head>
 	<meta charset="utf-8">
-  	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>NCC Aggregated Report</title>
-	  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
+	<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
 	<style>
 	:root {
 	  --bg: #0f172a;
@@ -1662,9 +1693,11 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
     background-color: var(--row1);
 	}
 	.container { max-width: 1400px; margin: 0 auto; padding: 7px 12px; }
-	.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+	.header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+	.title { flex: 1; min-width: 0; }
 	.title h1 { margin: 0; font-size: 22px; font-weight: 700; }
-	.title .sub { color: var(--muted); font-size: 12px; }
+	.title .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+	.header-actions { flex-shrink: 0; }
 	.controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0 18px 0; }
 	.control { background: #0d152b; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; gap: 8px; align-items: center; }
 	.control label { font-size: 12px; color: var(--muted); margin-right: 6px; }
@@ -1952,6 +1985,17 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   background: rgba(37, 99, 235, 0.2);
   color: var(--accent);
 }
+.cluster-load-more {
+  width: 100%;
+  padding: 10px;
+  background: #0a1123;
+  border: 1px solid var(--border);
+  color: var(--accent);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cluster-load-more:hover { border-color: var(--accent); background: rgba(37,99,235,0.1); }
 
 .modal-buttons {
   display: flex;
@@ -2226,33 +2270,68 @@ button, .cluster-display, .cluster-toggle {
   }
 }
 
+*:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.skip-link { position: absolute; top: -40px; left: 8px; background: var(--accent); color: #fff; padding: 8px 12px; border-radius: 6px; z-index: 100; text-decoration: none; font-size: 14px; }
+.skip-link:focus { top: 8px; }
+.report-footer { font-size: 0.8125rem; color: var(--muted); margin-top: 16px; padding: 12px 0; border-top: 1px solid var(--border); }
+.sum-item.clickable { cursor: pointer; transition: background 0.15s, border-color 0.15s; }
+.sum-item.clickable:hover { background: #0d152b; border-color: var(--accent); }
+.sum-item.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.th-sort { cursor: pointer; user-select: none; }
+.th-sort:hover { color: var(--text); }
+.th-sort .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.7; }
+.table-info { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
+.pagination button { background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.pagination button:hover:not(:disabled) { border-color: var(--accent); }
+.pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
+.pagination-info { font-size: 12px; color: var(--muted); }
+.pagination-size { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.pagination-size select { background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 6px; font-size: 12px; }
+.empty-state { text-align: center; padding: 48px 16px; color: var(--muted); }
+.empty-state p { margin: 0 0 12px 0; font-size: 14px; }
+.per-cluster-btn { font-size: 12px; padding: 8px 14px; background: transparent; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: border-color 0.15s, color 0.15s; }
+.per-cluster-btn:hover { border-color: var(--accent); color: #93c5fd; }
+.per-cluster-btn::after { content: "↗"; font-size: 11px; opacity: 0.8; }
+.per-cluster-links { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.per-cluster-links a { font-size: 12px; padding: 4px 10px; background: #0a1123; border: 1px solid var(--border); border-radius: 6px; color: #93c5fd; text-decoration: none; }
+.per-cluster-links a:hover { border-color: var(--accent); background: rgba(37,99,235,0.1); }
+
 	</style>
 	<script>
 
 	const AGG = {{.JSON}};
+	var CLUSTER_LINKS = {{.ClusterLinksJSON}};
 
-	
-let state = {
+	let state = {
   sortKey: "severity",
   sortDir: "asc",
   filterSev: new Set(["FAIL","WARN","ERR","INFO"]),
   filterClusters: new Set(),
   search: "",
-  showClusterModal: false,   
-  allClusters: []            
+  showClusterModal: false,
+  allClusters: [],
+  pageSize: 100,
+  currentPage: 0,
+  filteredRows: [],
+  clusterModalSearch: "",
+  clusterListVisible: 100,
+  showPerClusterModal: false,
+  perClusterSearch: "",
+  perClusterListVisible: 50
 };
 	
 	const sevRank = { FAIL: 1, WARN: 2, ERR: 3, INFO: 4 };
 	let selIndex = -1;
 
 function init() {
-  console.log("AGG length:", AGG.length);
   initClusters();
   updateAndRender();
   document.addEventListener("keydown", onKey);
-  const statusEl = document.getElementById('clusterStatus');
+  var statusEl = document.getElementById('clusterStatus');
   if (statusEl) {
     statusEl.onclick = toggleClusterFilter;
+    statusEl.onkeydown = function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleClusterFilter(); } };
   }
 }
 
@@ -2276,11 +2355,15 @@ function updateClusterStatus() {
     text = 'No clusters selected';
     className = 'cluster-status cluster-status-empty';
   } else if (count === total && total > 0) {
-    text = 'All clusters selected (' + total + ')';
+    text = total > 1 ? 'All clusters (' + total + ')' : 'All clusters selected';
     className = 'cluster-status';
   } else {
-    const names = Array.from(state.filterClusters).slice(0, 2);
-    text = names.join(', ') + (count > 2 ? ' +' + (count-2) : '') + ' (' + count + '/' + total + ')';
+    if (total > 8) {
+      text = count + ' of ' + total + ' clusters selected';
+    } else {
+      const names = Array.from(state.filterClusters).slice(0, 2);
+      text = names.join(', ') + (count > 2 ? ' +' + (count - 2) : '') + ' (' + count + '/' + total + ')';
+    }
     className = 'cluster-status';
   }
   statusEl.textContent = text;
@@ -2324,17 +2407,20 @@ function toggleClusterFilter() {
 
 function showClusterModal() {
   if (document.getElementById('clusterModal')) return;
-  
+  state.clusterModalSearch = "";
+  state.clusterListVisible = 100;
   const modal = document.createElement('div');
   modal.id = 'clusterModal';
   modal.className = 'cluster-modal';
   modal.innerHTML = [
     '<div class="cluster-modal-content">',
-      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">',
+      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">',
         '<h3 style="margin: 0; font-size: 18px;">Select Clusters</h3>',
-        '<button type="button" onclick="toggleClusterFilter()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;">✕</button>',
+        '<button type="button" onclick="toggleClusterFilter()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;" aria-label="Close">✕</button>',
       '</div>',
+      '<div style="margin-bottom: 12px;"><input type="text" id="clusterModalSearch" placeholder="Filter clusters..." style="width:100%; background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 8px; font-size: 13px;" aria-label="Filter cluster list"></div>',
       '<div class="cluster-list" id="clusterList"></div>',
+      '<div id="clusterListMore" style="margin-top: 8px;"></div>',
       '<div class="modal-buttons">',
         '<button type="button" onclick="selectAllClusters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: #0a1123; color: var(--text);">Select All</button>',
         '<button type="button" onclick="clearAllClusters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: #0a1123; color: var(--text);">Clear All</button>',
@@ -2342,8 +2428,12 @@ function showClusterModal() {
       '</div>',
     '</div>'
   ].join('');
-  
   document.body.appendChild(modal);
+  var searchEl = document.getElementById('clusterModalSearch');
+  if (searchEl) {
+    searchEl.oninput = function() { state.clusterModalSearch = this.value.trim(); renderClusterList(); };
+    searchEl.onkeydown = function(e) { if (e.key === 'Escape') { this.value = ''; state.clusterModalSearch = ''; renderClusterList(); this.focus(); } };
+  }
   renderClusterList();
 }
 
@@ -2351,19 +2441,115 @@ function hideClusterModal() {
   const modal = document.getElementById('clusterModal');
   if (modal) modal.remove();
 }
+function showPerClusterModal() {
+  if (typeof CLUSTER_LINKS === 'undefined' || !CLUSTER_LINKS.length) return;
+  if (document.getElementById('perClusterModal')) return;
+  state.perClusterSearch = "";
+  state.perClusterListVisible = 50;
+  var modal = document.createElement('div');
+  modal.id = 'perClusterModal';
+  modal.className = 'cluster-modal';
+  modal.innerHTML = [
+    '<div class="cluster-modal-content" style="max-width: 560px;">',
+      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">',
+        '<h3 style="margin: 0; font-size: 18px;">Per-cluster reports</h3>',
+        '<button type="button" onclick="hidePerClusterModal()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;" aria-label="Close">✕</button>',
+      '</div>',
+      '<div style="margin-bottom: 12px;"><input type="text" id="perClusterSearch" placeholder="Filter by cluster name or IP..." style="width:100%; background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 8px; font-size: 13px;" aria-label="Filter per-cluster links"></div>',
+      '<div class="cluster-list" id="perClusterList"></div>',
+      '<div id="perClusterListMore" style="margin-top: 8px;"></div>',
+    '</div>'
+  ].join('');
+  document.body.appendChild(modal);
+  var searchEl = document.getElementById('perClusterSearch');
+  if (searchEl) {
+    searchEl.oninput = function() { state.perClusterSearch = this.value.trim(); renderPerClusterList(); };
+    searchEl.onkeydown = function(e) { if (e.key === 'Escape') { this.value = ''; state.perClusterSearch = ''; renderPerClusterList(); this.focus(); } };
+    searchEl.focus();
+  }
+  state.showPerClusterModal = true;
+  renderPerClusterList();
+}
+function hidePerClusterModal() {
+  var modal = document.getElementById('perClusterModal');
+  if (modal) modal.remove();
+  state.showPerClusterModal = false;
+}
+function renderPerClusterList() {
+  var list = document.getElementById('perClusterList');
+  var moreEl = document.getElementById('perClusterListMore');
+  if (!list || typeof CLUSTER_LINKS === 'undefined') return;
+  var needle = state.perClusterSearch.toLowerCase();
+  var filtered = needle ? CLUSTER_LINKS.filter(function(item) { return (item.Cluster || '').toLowerCase().indexOf(needle) !== -1; }) : CLUSTER_LINKS.slice();
+  var visible = filtered.slice(0, state.perClusterListVisible);
+  var items = visible.map(function(item) {
+    var name = escapeHtml(item.Cluster || '');
+    var href = escapeHtml(item.HTML || '#');
+    return '<a href="' + href + '" target="_blank" rel="noopener" class="cluster-item" style="display:block; text-decoration: none; color: inherit;">' + name + '</a>';
+  });
+  list.innerHTML = items.join('');
+  if (moreEl) {
+    var remaining = filtered.length - state.perClusterListVisible;
+    if (remaining > 0) {
+      moreEl.innerHTML = '<button type="button" class="cluster-load-more" onclick="state.perClusterListVisible += 50; renderPerClusterList();">Show more (' + remaining + ' remaining)</button>';
+      moreEl.style.display = 'block';
+    } else {
+      moreEl.innerHTML = '';
+      moreEl.style.display = 'none';
+    }
+  }
+}
 
 function renderClusterList() {
   const list = document.getElementById('clusterList');
+  const moreEl = document.getElementById('clusterListMore');
   if (!list) return;
-  
-  const items = state.allClusters.map(function(name) {
-    const active = state.filterClusters.has(name) ? 'active' : '';
-    const safeName = escapeHtml(name);
-    return '<div class="cluster-item ' + active + '" onclick="toggleCluster(\'' + safeName + '\')">' + safeName + '</div>';
+  var needle = state.clusterModalSearch.toLowerCase();
+  var filtered = needle ? state.allClusters.filter(function(name) { return name.toLowerCase().indexOf(needle) !== -1; }) : state.allClusters.slice();
+  var visible = filtered.slice(0, state.clusterListVisible);
+  var items = visible.map(function(name) {
+    var active = state.filterClusters.has(name) ? 'active' : '';
+    var safeName = escapeHtml(name);
+    var safeJs = jsStrEsc(name);
+    return '<div class="cluster-item ' + active + '" onclick="toggleCluster(\'' + safeJs + '\')">' + safeName + '</div>';
   });
   list.innerHTML = items.join('');
+  if (moreEl) {
+    var remaining = filtered.length - state.clusterListVisible;
+    if (remaining > 0) {
+      moreEl.innerHTML = '<button type="button" class="cluster-load-more" onclick="state.clusterListVisible += 100; renderClusterList();">Show more (' + remaining + ' remaining)</button>';
+      moreEl.style.display = 'block';
+    } else {
+      moreEl.innerHTML = '';
+      moreEl.style.display = 'none';
+    }
+  }
 }
 	
+	function filterBySev(sev) {
+	  if (sev === null) {
+	    state.filterSev = new Set(["FAIL","WARN","ERR","INFO"]);
+	  } else {
+	    state.filterSev = new Set([sev]);
+	  }
+	  document.querySelectorAll('.control input[type="checkbox"]').forEach(function(cb) {
+	    var m = (cb.getAttribute('onchange') || '').match(/'([^']+)'/);
+	    if (m) cb.checked = state.filterSev.has(m[1]);
+	  });
+	  updateAndRender();
+	}
+	function clearFilters() {
+	  state.search = "";
+	  var sb = document.getElementById("searchBox");
+	  if (sb) sb.value = "";
+	  state.filterClusters = new Set(state.allClusters);
+	  state.filterSev = new Set(["FAIL","WARN","ERR","INFO"]);
+	  document.querySelectorAll('.control input[type="checkbox"]').forEach(function(cb) { cb.checked = true; });
+	  renderClusterList();
+	  updateClusterStatus();
+	  updateAndRender();
+	  if (state.showClusterModal) { state.showClusterModal = false; hideClusterModal(); }
+	}
 	function setSev(checked, sev) {
 	  if (checked) state.filterSev.add(sev); else state.filterSev.delete(sev);
 	  updateAndRender();
@@ -2383,7 +2569,23 @@ function renderClusterList() {
 	function sortBy(key) {
 	  if (state.sortKey === key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
 	  else { state.sortKey = key; state.sortDir = "asc"; }
+	  updateSortIndicators();
 	  updateAndRender();
+	}
+	function updateSortIndicators() {
+	  document.querySelectorAll('.th-sort .sort-arrow').forEach(function(el) {
+	    var key = el.id ? el.id.replace('arrow-','') : '';
+	    if (key === 'clusterName') key = 'clusterName';
+	    if (key === 'cluster') key = 'cluster';
+	    if (key === 'severity') key = 'severity';
+	    if (key === 'check') key = 'check';
+	    el.textContent = state.sortKey === key ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+	  });
+	  var keys = ['clusterName','cluster','severity','check'];
+	  keys.forEach(function(key) {
+	    var el = document.getElementById('arrow-' + key);
+	    if (el) el.textContent = state.sortKey === key ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+	  });
 	}
 	
 function filterData() {
@@ -2450,6 +2652,10 @@ function updateCounts(rows) {
 	  return (s || "").toString()
 		.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
 		.replaceAll('"',"&quot;").replaceAll("'","&#39;");
+	}
+	function jsStrEsc(s) {
+	  return (s || "").toString()
+		.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\r/g, " ").replace(/\n/g, " ");
 	}
 	
 	function highlight(text, needle) {
@@ -2643,12 +2849,22 @@ function initTooltips() {
 	  if (k === "/") {
 		e.preventDefault();
 		const sb = document.getElementById("searchBox");
-		sb.focus(); sb.select();
+		if (sb) { sb.focus(); sb.select(); }
 		return;
 	  }
 	  if (k === "Escape") {
+		if (state.showPerClusterModal) {
+		  state.showPerClusterModal = false;
+		  hidePerClusterModal();
+		  return;
+		}
+		if (state.showClusterModal) {
+		  state.showClusterModal = false;
+		  hideClusterModal();
+		  return;
+		}
 		if (state.search) {
-		  state.search = ""; document.getElementById("searchBox").value = "";
+		  state.search = ""; var sb = document.getElementById("searchBox"); if (sb) sb.value = "";
 		  updateAndRender();
 		}
 		return;
@@ -2678,7 +2894,50 @@ function initTooltips() {
 	  
 	  updateCounts(rows);
 	  rows = sortData(rows.slice());
-	  renderTable(rows);
+	  state.filteredRows = rows;
+	  var totalRows = rows.length;
+	  var totalPages = state.pageSize > 0 ? Math.max(1, Math.ceil(totalRows / state.pageSize)) : 1;
+	  if (state.currentPage >= totalPages) state.currentPage = Math.max(0, totalPages - 1);
+	  var pageStart = state.currentPage * state.pageSize;
+	  var pageEnd = Math.min(pageStart + state.pageSize, totalRows);
+	  var pageRows = totalRows > 0 ? rows.slice(pageStart, pageEnd) : [];
+	  var infoEl = document.getElementById("tableInfo");
+	  var emptyEl = document.getElementById("emptyState");
+	  var tableEl = document.getElementById("main-table");
+	  var paginationEl = document.getElementById("pagination");
+	  if (infoEl) {
+	    if (totalRows === 0) infoEl.textContent = "Showing 0 rows";
+	    else if (totalRows <= state.pageSize) infoEl.textContent = "Showing " + totalRows + " row" + (totalRows === 1 ? "" : "s");
+	    else infoEl.textContent = "Showing " + (pageStart + 1) + "–" + pageEnd + " of " + totalRows + " rows";
+	  }
+	  if (emptyEl && tableEl) {
+	    if (totalRows === 0) { tableEl.style.display = "none"; emptyEl.style.display = "block"; if (paginationEl) paginationEl.style.display = "none"; }
+	    else { tableEl.style.display = ""; emptyEl.style.display = "none"; if (paginationEl) paginationEl.style.display = totalRows > state.pageSize ? "flex" : "none"; }
+	  }
+	  if (paginationEl && totalRows > state.pageSize) {
+	    paginationEl.innerHTML = '<button type="button" onclick="goToPage(' + (state.currentPage - 1) + ')" ' + (state.currentPage === 0 ? 'disabled' : '') + ' aria-label="Previous page">Prev</button>' +
+	      '<span class="pagination-info">Page ' + (state.currentPage + 1) + ' of ' + totalPages + '</span>' +
+	      '<button type="button" onclick="goToPage(' + (state.currentPage + 1) + ')" ' + (state.currentPage >= totalPages - 1 ? 'disabled' : '') + ' aria-label="Next page">Next</button>' +
+	      '<label class="pagination-size"><span>Rows</span><select id="pageSizeSelect" onchange="setPageSize(parseInt(this.value,10))">' +
+	      (state.pageSize === 50 ? '<option value="50" selected>50</option>' : '<option value="50">50</option>') +
+	      (state.pageSize === 100 ? '<option value="100" selected>100</option>' : '<option value="100">100</option>') +
+	      (state.pageSize === 200 ? '<option value="200" selected>200</option>' : '<option value="200">200</option>') +
+	      (state.pageSize === 500 ? '<option value="500" selected>500</option>' : '<option value="500">500</option>') +
+	      '</select></label>';
+	  }
+	  updateSortIndicators();
+	  var fc = document.getElementById("footerClusterCount");
+	  if (fc) fc.textContent = "Clusters: " + state.filterClusters.size + "/" + state.allClusters.length;
+	  renderTable(pageRows);
+	}
+	function goToPage(p) {
+	  state.currentPage = Math.max(0, Math.min(p, Math.ceil(state.filteredRows.length / state.pageSize) - 1));
+	  updateAndRender();
+	}
+	function setPageSize(n) {
+	  state.pageSize = n;
+	  state.currentPage = 0;
+	  updateAndRender();
 	}
 	
 	function downloadCSV() {
@@ -2714,95 +2973,82 @@ function initTooltips() {
 	</script>
 	</head>
 	<body onload="init()">
+	<a href="#main-table" class="skip-link">Skip to table</a>
 	<div class="container">
 	  <div class="header">
 		<div class="title">
 		  <h1>NCC Aggregated Report</h1>
-		  <div class="sub">Generated at {{.GeneratedAt}}</div>
+		  <div class="sub">Generated at {{.GeneratedAt}}{{if .Clusters}} · {{len .Clusters}} cluster{{if eq (len .Clusters) 1}}{{else}}s{{end}}{{end}}</div>
 		</div>
-        <!--
-        <div class="legend">
-          <span class="badge"><span class="dot fail"></span> FAIL</span>
-          <span class="badge"><span class="dot warn"></span> WARN</span>
-          <span class="badge"><span class="dot err"></span> ERR</span>
-          <span class="badge"><span class="dot info"></span> INFO</span>
-        </div>
-        -->
+		{{if .Clusters}}
+		<div class="header-actions">
+		  <button type="button" class="per-cluster-btn" onclick="showPerClusterModal()" aria-label="Open per-cluster report links">Per-cluster reports ({{len .Clusters}})</button>
+		</div>
+		{{end}}
 	  </div>
 	
 	  <div class="controls">
 		<div class="control">
-		  <label>Search</label>
-		  <input id="searchBox" type="text" placeholder="Type to filter..." oninput="onSearchDebounced(this)" />
+		  <label for="searchBox">Search</label>
+		  <input id="searchBox" type="text" placeholder="Type to filter..." oninput="onSearchDebounced(this)" aria-label="Filter rows by search text" />
 		</div>
 		<div class="control">
 		  <label>Severity</label>
-<label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'FAIL')">
-    <span style="color: var(--fail);">FAIL</span>
-  </label>
-  <label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'WARN')">
-    <span style="color: var(--warn);">WARN</span>
-  </label>
-    <label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'ERR')">
-    <span style="color: var(--err);">ERR</span>
-  </label>
-  <label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'INFO')">
-    <span style="color: var(--info);">INFO</span>
-  </label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'FAIL')"> <span style="color: var(--fail);">FAIL</span></label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'WARN')"> <span style="color: var(--warn);">WARN</span></label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'ERR')"> <span style="color: var(--err);">ERR</span></label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'INFO')"> <span style="color: var(--info);">INFO</span></label>
 		</div>
 <div class="control">
-  <label>Clusters</label>
+  <label for="clusterStatus">Clusters</label>
   <div class="cluster-status-wrapper">
-    <div id="clusterStatus" class="cluster-status">All clusters selected (4)</div>
-    <!-- <button class="cluster-edit-btn" onclick="toggleClusterFilter()">⚙️ Edit</button> -->
+    <div id="clusterStatus" class="cluster-status" role="button" tabindex="0" aria-label="Select clusters to filter" aria-haspopup="dialog">All clusters selected</div>
   </div>
 </div>
 		<div class="control">
-		  <button onclick="downloadCSV()">Export CSV</button>
-		  <button onclick="downloadJSON()">Export JSON</button>
+		  <button type="button" onclick="downloadCSV()" aria-label="Export filtered rows as CSV">Export CSV</button>
+		  <button type="button" onclick="downloadJSON()" aria-label="Export filtered rows as JSON">Export JSON</button>
 		</div>
 	  </div>
 	
 	  <div class="summary">
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumTotal" role="button" tabindex="0" onclick="filterBySev(null)" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev(null); }" aria-label="Show all severities">
 		  <div class="label">Total</div>
 		  <div class="count" id="countTotal">0</div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumFail" role="button" tabindex="0" onclick="filterBySev('FAIL')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('FAIL'); }" aria-label="Show only FAIL">
 		  <div class="label">FAIL</div>
 		  <div class="count" id="countFail">0</div>
 		  <div class="progress fail"><span id="barFail" style="width:0%"></span></div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumWarn" role="button" tabindex="0" onclick="filterBySev('WARN')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('WARN'); }" aria-label="Show only WARN">
 		  <div class="label">WARN</div>
 		  <div class="count" id="countWarn">0</div>
 		  <div class="progress warn"><span id="barWarn" style="width:0%"></span></div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumErr" role="button" tabindex="0" onclick="filterBySev('ERR')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('ERR'); }" aria-label="Show only ERR">
 		  <div class="label">ERR</div>
 		  <div class="count" id="countErr">0</div>
 		  <div class="progress err"><span id="barErr" style="width:0%"></span></div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumInfo" role="button" tabindex="0" onclick="filterBySev('INFO')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('INFO'); }" aria-label="Show only INFO">
 		  <div class="label">INFO</div>
 		  <div class="count" id="countInfo">0</div>
 		  <div class="progress info"><span id="barInfo" style="width:0%"></span></div>
 		</div>
 	  </div>
 	
+	  <div class="table-info" id="tableInfo">Showing 0 rows</div>
+	  <div id="pagination" class="pagination" style="display:none;"></div>
 	  <div class="card">
 		<div class="scroll">
-		  <table>
+		  <table id="main-table">
 			<thead>
 			  <tr>
-			  	<th class="col-cname" onclick="sortBy('clusterName')">Cluster Name</th>
-				<th class="col-cluster" onclick="sortBy('cluster')">Cluster</th>
-				<th class="col-sev" onclick="sortBy('severity')">Severity</th>
-				<th class="col-title" onclick="sortBy('check')">NCC Alert Title</th>
+			  	<th class="col-cname th-sort" data-sort="clusterName" onclick="sortBy('clusterName')">Cluster Name <span class="sort-arrow" id="arrow-clusterName"></span></th>
+				<th class="col-cluster th-sort" data-sort="cluster" onclick="sortBy('cluster')">Cluster <span class="sort-arrow" id="arrow-cluster"></span></th>
+				<th class="col-sev th-sort" data-sort="severity" onclick="sortBy('severity')">Severity <span class="sort-arrow" id="arrow-severity"></span></th>
+				<th class="col-title th-sort" data-sort="check" onclick="sortBy('check')">NCC Alert Title <span class="sort-arrow" id="arrow-check"></span></th>
 				<th class="col-kb">KB</th>
 				<th class="col-detail">Detail</th>
 				<th class="col-actions">Actions</th>
@@ -2810,25 +3056,16 @@ function initTooltips() {
 			</thead>
 			<tbody id="tbody"></tbody>
 		  </table>
+		  <div id="emptyState" class="empty-state" style="display:none;">
+		    <p>No rows match your filters.</p>
+		    <button type="button" onclick="clearFilters()">Clear filters</button>
+		  </div>
 		</div>
 	  </div>
 	
      <footer class="report-footer">
-    Keyboard: “/” to focus search, ↑/↓ to move, Esc to clear search. Full details visible in table.
+    <strong>Keyboard:</strong> / focus search · ↑/↓ move row · Esc clear search or close modal. <span id="footerClusterCount"></span>
 </footer>
-
-
-<style>
-    .report-footer {
-        font-size: 0.8125rem;
-        color: #666; /* Better contrast than #aaa */
-        margin-bottom: 0;
-        padding: 10px; /* Adds breathing room */
-        bottom: 0;
-        left: 0;
-        width: 100%;
-    }
-</style>
 	</div>
 	</body>
 	</html>`
@@ -2862,17 +3099,23 @@ function initTooltips() {
 		return fmt.Errorf("marshal agg json: %w", err)
 	}
 
+	clusterLinksJSON, _ := json.Marshal(perCluster)
+	if clusterLinksJSON == nil {
+		clusterLinksJSON = []byte("[]")
+	}
 	data := struct {
-		JSON           template.JS
-		Clusters       []struct{ Cluster, HTML, CSV string }
-		GeneratedAt    string
-		ClusterName    string
-		ClusterVersion string
-		NCCVersion     string
+		JSON             template.JS
+		ClusterLinksJSON template.JS
+		Clusters         []struct{ Cluster, HTML, CSV string }
+		GeneratedAt      string
+		ClusterName      string
+		ClusterVersion   string
+		NCCVersion       string
 	}{
-		JSON:        template.JS(jsonBytes),
-		Clusters:    perCluster,
-		GeneratedAt: time.Now().Format(time.RFC3339),
+		JSON:             template.JS(jsonBytes),
+		ClusterLinksJSON: template.JS(clusterLinksJSON),
+		Clusters:         perCluster,
+		GeneratedAt:      time.Now().Format(time.RFC3339),
 	}
 
 	f, err := fs.Create(path)
@@ -3430,6 +3673,20 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 			consoleLogger := zerolog.New(consoleWriter).With().Timestamp().Logger()
 			zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
+			// Generate test aggregated report (no config required)
+			if genN, _ := cmd.Flags().GetInt("gen-test-agg"); genN > 0 {
+				outDir := viper.GetString("output-dir-filtered")
+				if outDir == "" {
+					outDir = "outputfiles"
+				}
+				if err := generateTestAgg(genN, outDir); err != nil {
+					consoleLogger.Error().Err(err).Int("clusters", genN).Msg("gen-test-agg failed")
+					return fmt.Errorf("gen-test-agg: %w", err)
+				}
+				fmt.Printf("Generated test aggregated report: %d clusters, output in %s/index.html\n", genN, outDir)
+				return nil
+			}
+
 			cfg, err := bindConfig()
 			if err != nil {
 				consoleLogger.Error().Err(err).Msg("configuration error")
@@ -3929,6 +4186,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().String("retry-base-delay", "400ms", "Base retry delay (with jitter, exponential)")
 	cmd.Flags().String("retry-max-delay", "8s", "Max retry delay cap")
 	cmd.Flags().Bool("replay", false, "Replay from existing logs without running NCC")
+	cmd.Flags().Int("gen-test-agg", 0, "Generate a test index.html with N clusters for scalability testing (no API calls)")
 	cmd.Flags().String("prom-dir", "promfiles", "Directory for Prometheus metrics")
 	cmd.Flags().Bool("email-enabled", false, "Enable email notifications")
 	cmd.Flags().String("smtp-server", "", "SMTP server (smtp.gmail.com)")
@@ -3959,6 +4217,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	_ = viper.BindPFlag("outputs", cmd.Flags().Lookup("outputs"))
 	_ = viper.BindPFlag("output-dir-logs", cmd.Flags().Lookup("output-dir-logs"))
 	_ = viper.BindPFlag("output-dir-filtered", cmd.Flags().Lookup("output-dir-filtered"))
+	_ = viper.BindPFlag("gen-test-agg", cmd.Flags().Lookup("gen-test-agg"))
 	_ = viper.BindPFlag("log-file", cmd.Flags().Lookup("log-file"))
 	_ = viper.BindPFlag("log-level", cmd.Flags().Lookup("log-level"))
 	_ = viper.BindPFlag("log-http", cmd.Flags().Lookup("log-http"))
