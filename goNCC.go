@@ -1539,6 +1539,9 @@ type JSONSummary struct {
 }
 
 func generateJSON(fs FS, blocks []ParsedBlock, filename string, meta HTMLMeta) error {
+	if err := fs.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return err
+	}
 	f, err := fs.Create(filename)
 	if err != nil {
 		return err

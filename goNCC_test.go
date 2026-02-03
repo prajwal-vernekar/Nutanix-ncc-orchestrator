@@ -1066,12 +1066,19 @@ func BenchmarkSanitizeLabel(b *testing.B) {
 
 // ==================== CLI and Configuration Tests ====================
 
+// setMinimalValidConfig sets clusters and username so bindConfig() validation passes.
+func setMinimalValidConfig() {
+	viper.Set("clusters", "10.0.0.1")
+	viper.Set("username", "testuser")
+}
+
 func TestBindConfigDefaults(t *testing.T) {
 	// Reset viper to clean state
 	viper.Reset()
 	viper.SetEnvPrefix("ncc")
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1201,6 +1208,7 @@ func TestBindConfigOutputFormats(t *testing.T) {
 			if tt.outputs != "" {
 				viper.Set("outputs", tt.outputs)
 			}
+			setMinimalValidConfig()
 
 			cfg, err := bindConfig()
 			if err != nil {
@@ -1242,6 +1250,7 @@ func TestBindConfigDurationParsing(t *testing.T) {
 			viper.AutomaticEnv()
 
 			viper.Set("timeout", tt.timeout)
+			setMinimalValidConfig()
 
 			cfg, err := bindConfig()
 			if err != nil {
@@ -1279,6 +1288,7 @@ func TestBindConfigSeverityFilter(t *testing.T) {
 			if tt.filter != "" {
 				viper.Set("severity-filter", tt.filter)
 			}
+			setMinimalValidConfig()
 
 			cfg, err := bindConfig()
 			if err != nil {
@@ -1312,6 +1322,7 @@ func TestBindConfigEmailSettings(t *testing.T) {
 	viper.Set("email-from", "ncc@example.com")
 	viper.Set("email-to", "admin@example.com,ops@example.com")
 	viper.Set("email-use-tls", true)
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1356,6 +1367,7 @@ func TestBindConfigWebhookSettings(t *testing.T) {
 		"X-Auth-Token": "token123",
 		"X-Custom":     "value",
 	})
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1385,6 +1397,7 @@ func TestBindConfigSlackSettings(t *testing.T) {
 	viper.Set("slack-enabled", true)
 	viper.Set("slack-webhook-url", "https://hooks.slack.com/services/XXX/YYY/ZZZ")
 	viper.Set("slack-channel", "#ncc-alerts")
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1411,6 +1424,7 @@ func TestBindConfigRetrySettings(t *testing.T) {
 	viper.Set("retry-max-attempts", "10")
 	viper.Set("retry-base-delay", "1s")
 	viper.Set("retry-max-delay", "30s")
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1436,6 +1450,7 @@ func TestBindConfigPollingSettings(t *testing.T) {
 
 	viper.Set("poll-interval", "30s")
 	viper.Set("poll-jitter", "5s")
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1459,6 +1474,7 @@ func TestBindConfigLoggingSettings(t *testing.T) {
 	viper.Set("log-file", "custom.log")
 	viper.Set("log-level", "debug")
 	viper.Set("log-http", true)
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1483,6 +1499,7 @@ func TestBindConfigPrometheusSettings(t *testing.T) {
 	viper.AutomaticEnv()
 
 	viper.Set("prom-dir", "custom-prom")
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1520,14 +1537,13 @@ func TestBindConfigEmptyClusters(t *testing.T) {
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
 
-	// Don't set clusters
-	cfg, err := bindConfig()
-	if err != nil {
-		t.Fatalf("bindConfig() failed: %v", err)
+	// Don't set clusters - validation should fail
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("bindConfig() expected to fail when no clusters provided")
 	}
-
-	if len(cfg.Clusters) != 0 {
-		t.Errorf("Expected empty clusters, got %v", cfg.Clusters)
+	if !strings.Contains(err.Error(), "at least one cluster") {
+		t.Errorf("Expected error about clusters, got: %v", err)
 	}
 }
 
@@ -1538,6 +1554,7 @@ func TestBindConfigMultipleClusters(t *testing.T) {
 	viper.AutomaticEnv()
 
 	viper.Set("clusters", "10.0.1.1,10.0.2.1,10.0.3.1,10.0.4.1")
+	viper.Set("username", "testuser")
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1564,6 +1581,7 @@ func TestBindConfigInvalidDuration(t *testing.T) {
 
 	// Set invalid duration - should use default
 	viper.Set("timeout", "not-a-duration")
+	setMinimalValidConfig()
 
 	cfg, err := bindConfig()
 	if err != nil {
@@ -1585,7 +1603,7 @@ func TestBindConfigMaxParallel(t *testing.T) {
 		{"Valid value", "8", 8},
 		{"Single cluster", "1", 1},
 		{"Large value", "100", 100},
-		{"Invalid string", "invalid", 0}, // viper.GetInt returns 0 for invalid
+		{"Invalid string", "invalid", 4}, // viper returns 0; app defaults to 4 when <= 0
 	}
 
 	for _, tt := range tests {
@@ -1596,6 +1614,7 @@ func TestBindConfigMaxParallel(t *testing.T) {
 			viper.AutomaticEnv()
 
 			viper.Set("max-parallel", tt.value)
+			setMinimalValidConfig()
 
 			cfg, err := bindConfig()
 			if err != nil {
@@ -1628,6 +1647,7 @@ func TestBindConfigSMTPPort(t *testing.T) {
 			viper.AutomaticEnv()
 
 			viper.Set("smtp-port", tt.port)
+			setMinimalValidConfig()
 
 			cfg, err := bindConfig()
 			if err != nil {
