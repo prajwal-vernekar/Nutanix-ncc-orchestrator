@@ -2426,7 +2426,7 @@ function updateCounts(rows) {
   document.getElementById("barErr").style.width  = pct.ERR  + "%";
   document.getElementById("barInfo").style.width = pct.INFO + "%";
 
-  <!-- const pc = document.getElementById("perCluster"); pc.innerHTML = ""; -->
+  // const pc = document.getElementById("perCluster"); pc.innerHTML = "";
 }
 
 
@@ -3422,16 +3422,31 @@ Stream: %s
 Build Date: %s
 Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Setup console logger first for early error visibility
+			consoleWriter := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}
+			consoleLogger := zerolog.New(consoleWriter).With().Timestamp().Logger()
+			zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
 			cfg, err := bindConfig()
 			if err != nil {
-				return err
+				consoleLogger.Error().Err(err).Msg("configuration error")
+				return fmt.Errorf("configuration error: %w", err)
 			}
 
 			lvl := parseLogLevel(cfg.LogLevel)
+			// Validate log level
+			if lvl > zerolog.FatalLevel {
+				consoleLogger.Warn().Int("level", int(lvl)).Msg("invalid log level, using info level")
+				lvl = zerolog.InfoLevel
+			}
+
 			if err := setupFileLogger(cfg.LogFile, lvl); err != nil {
+				consoleLogger.Error().Err(err).Str("logFile", cfg.LogFile).Msg("failed to setup file logger")
 				return fmt.Errorf("setup logger: %w", err)
 			}
+
+			// Set global log level after file logger is set up
+			zerolog.SetGlobalLevel(lvl)
 			log.Info().
 				Strs("clusters", cfg.Clusters).
 				Str("username", cfg.Username).
@@ -3459,10 +3474,14 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 			}
 			// Validate required fields first
 			if len(cfg.Clusters) == 0 {
-				return errors.New("no clusters provided (--clusters, env, or config)")
+				err := errors.New("no clusters provided (--clusters, env, or config)")
+				log.Error().Msg(err.Error())
+				return err
 			}
 			if cfg.Username == "" {
-				return errors.New("missing --username or config username")
+				err := errors.New("missing --username or config username")
+				log.Error().Msg(err.Error())
+				return err
 			}
 
 			// Dry-run mode: perform full validation and exit
@@ -3770,7 +3789,14 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						setPhase("failed")
 						phaseBar.SetCurrent(1)     // Set current to match total
 						phaseBar.SetTotal(1, true) // Complete phaseBar on error
-						log.Error().Str("cluster", cl).Err(err).Msg("cluster run failed")
+						// Log with detailed error information
+						log.Error().
+							Str("cluster", cl).
+							Err(err).
+							Str("error_type", fmt.Sprintf("%T", err)).
+							Msg("cluster run failed")
+						// Also print to console for visibility
+						fmt.Fprintf(os.Stderr, "\n❌ Cluster %s failed: %v\n", cl, err)
 						results <- ClusterResult{Cluster: cl, Blocks: nil, Err: err}
 						return
 					}
@@ -3959,8 +3985,16 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 }
 
 func main() {
+	// Ensure logs are flushed on exit
+	defer func() {
+		// Give logger time to flush
+		time.Sleep(100 * time.Millisecond)
+	}()
+
 	if err := newRootCmd().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error()) // Prints just the message without extra prefix
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		// Try to log the error if logger is available
+		log.Error().Err(err).Msg("application error")
 		os.Exit(1)
 	}
 	os.Exit(0)
