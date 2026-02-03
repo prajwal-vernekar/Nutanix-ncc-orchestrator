@@ -2,7 +2,6 @@
 
 A CLI tool to run NCC (Nutanix Cluster Check) across multiple clusters in parallel, aggregate results, and generate HTML/CSV reports. Built in Go for efficiency and cross-platform support.
 
-**Status:** Production ready — full validation, tests, graceful shutdown, structured logging, and optional Slack/webhook/email notifications.
 
 ## Author
 
