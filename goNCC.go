@@ -18,13 +18,16 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/smtp"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -38,7 +41,7 @@ import (
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
-/************** Config **************/
+// ==================== Configuration ====================
 
 type Config struct {
 	Clusters           []string
@@ -51,19 +54,31 @@ type Config struct {
 	PollJitter         time.Duration
 	OutputDirLogs      string
 	OutputDirFiltered  string
-	OutputFormats      []string // html,csv
+	OutputFormats      []string // html,csv,json
 	MaxParallel        int
 	TLSMinVersion      uint16
 	LogFile            string
+
+	// Filtering
+	SeverityFilter []string // Only include these severities (FAIL, WARN, ERR, INFO)
 
 	// Logging options
 	LogLevel string // 0..5 or names
 	LogHTTP  bool   // dump HTTP request/response
 
+	// Dry-run mode
+	DryRun bool // Don't actually run checks, just validate config
+
 	// Retry tuning
 	RetryMaxAttempts int
 	RetryBaseDelay   time.Duration
 	RetryMaxDelay    time.Duration
+
+	// HTTP connection pooling
+	MaxIdleConns        int           // Max idle connections per host
+	MaxIdleConnsPerHost int           // Max idle connections per host
+	MaxConnsPerHost     int           // Max total connections per host
+	IdleConnTimeout     time.Duration // Idle connection timeout
 
 	// Prometheus metrics
 	PromDir string `mapstructure:"prom-dir"`
@@ -82,6 +97,11 @@ type Config struct {
 	WebhookEnabled bool
 	WebhookURL     string
 	WebhookHeaders map[string]string `mapstructure:"webhook-headers"`
+
+	// Slack
+	SlackEnabled    bool
+	SlackWebhookURL string `mapstructure:"slack-webhook-url"`
+	SlackChannel    string `mapstructure:"slack-channel"`
 }
 
 type NotificationSummary struct {
@@ -103,9 +123,15 @@ type HTMLMeta struct {
 }
 
 type HTMLData struct {
-	Rows []Row
-	Now  string
-	Meta HTMLMeta
+	Rows    []Row
+	Now     string
+	Meta    HTMLMeta
+	Summary SummaryCounts
+}
+
+// SummaryCounts holds per-severity counts for the report header.
+type SummaryCounts struct {
+	FAIL, WARN, ERR, INFO int
 }
 
 const termsText = `
@@ -183,6 +209,44 @@ Disclaimer:
      The developer or Nutanix shall not be held liable for any consequences resulting from its use.
 `
 
+// ==================== Constants ====================
+
+const (
+	// Default values
+	defaultTimeout           = 15 * time.Minute
+	defaultRequestTimeout    = 20 * time.Second
+	defaultPollInterval      = 15 * time.Second
+	defaultPollJitter        = 2 * time.Second
+	defaultMaxParallel       = 4
+	defaultRetryAttempts     = 6
+	defaultRetryBaseDelay    = 400 * time.Millisecond
+	defaultRetryMaxDelay     = 8 * time.Second
+	defaultOutputDirLogs     = "nccfiles"
+	defaultOutputDirFiltered = "outputfiles"
+	defaultPromDir           = "promfiles"
+	defaultLogFile           = "logs/ncc-runner.log"
+	defaultOutputFormat      = "html"
+
+	// HTTP connection pooling defaults
+	defaultMaxIdleConns        = 100
+	defaultMaxIdleConnsPerHost = 10
+	defaultMaxConnsPerHost     = 0 // 0 = unlimited
+	defaultIdleConnTimeout     = 90 * time.Second
+
+	// Graceful shutdown
+	shutdownTimeout = 30 * time.Second
+
+	// Security
+	minPasswordLength = 1
+	maxClusterNameLen = 255
+	maxURLLength      = 2048
+
+	// Prism Gateway port
+	prismGatewayPort = 9440
+)
+
+// ==================== Utility Functions ====================
+
 func splitCSV(s string) []string {
 	if s == "" {
 		return nil
@@ -202,10 +266,236 @@ func mustParseDur(s string, def time.Duration) time.Duration {
 	if s == "" {
 		return def
 	}
-	if d, err := time.ParseDuration(s); err == nil {
-		return d
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return def
 	}
-	return def
+	return d
+}
+
+// ==================== Validation Functions ====================
+
+// validateClusterAddress validates cluster IP or hostname
+func validateClusterAddress(cluster string) error {
+	if cluster == "" {
+		return errors.New("cluster address cannot be empty")
+	}
+	if len(cluster) > maxClusterNameLen {
+		return fmt.Errorf("cluster address too long (max %d chars)", maxClusterNameLen)
+	}
+
+	// Check if it's a valid IP or hostname
+	if net.ParseIP(cluster) != nil {
+		return nil // Valid IP
+	}
+
+	// Validate hostname format (basic check)
+	if strings.Contains(cluster, "..") || strings.HasPrefix(cluster, ".") || strings.HasSuffix(cluster, ".") {
+		return errors.New("invalid cluster hostname format")
+	}
+
+	// Check for valid characters in hostname
+	for _, r := range cluster {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_') {
+			return fmt.Errorf("invalid character in cluster address: %c", r)
+		}
+	}
+
+	return nil
+}
+
+// validateClusters validates all cluster addresses
+func validateClusters(clusters []string) error {
+	if len(clusters) == 0 {
+		return errors.New("at least one cluster must be provided")
+	}
+
+	seen := make(map[string]bool)
+	for i, cluster := range clusters {
+		if err := validateClusterAddress(cluster); err != nil {
+			return fmt.Errorf("cluster %d (%s): %w", i+1, cluster, err)
+		}
+		if seen[cluster] {
+			return fmt.Errorf("duplicate cluster address: %s", cluster)
+		}
+		seen[cluster] = true
+	}
+
+	return nil
+}
+
+// validateURL validates webhook/Slack URLs
+func validateURL(urlStr string) error {
+	if urlStr == "" {
+		return errors.New("URL cannot be empty")
+	}
+	if len(urlStr) > maxURLLength {
+		return fmt.Errorf("URL too long (max %d chars)", maxURLLength)
+	}
+
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		return fmt.Errorf("invalid URL format: %w", err)
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL must use http or https scheme, got: %s", parsed.Scheme)
+	}
+
+	if parsed.Host == "" {
+		return errors.New("URL must have a host")
+	}
+
+	return nil
+}
+
+// validateEmailAddress validates email address format
+func validateEmailAddress(email string) error {
+	if email == "" {
+		return errors.New("email address cannot be empty")
+	}
+
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return errors.New("invalid email format: must contain exactly one @")
+	}
+
+	local, domain := parts[0], parts[1]
+	if len(local) == 0 || len(domain) == 0 {
+		return errors.New("invalid email format: local or domain part is empty")
+	}
+
+	if !strings.Contains(domain, ".") {
+		return errors.New("invalid email format: domain must contain a dot")
+	}
+
+	return nil
+}
+
+// validateConfig performs comprehensive configuration validation
+func validateConfig(cfg Config) error {
+	// Validate clusters
+	if err := validateClusters(cfg.Clusters); err != nil {
+		return fmt.Errorf("cluster validation failed: %w", err)
+	}
+
+	// Validate username
+	if cfg.Username == "" {
+		return errors.New("username cannot be empty")
+	}
+	if len(cfg.Username) > 255 {
+		return errors.New("username too long (max 255 characters)")
+	}
+
+	// Validate timeouts
+	if cfg.Timeout <= 0 {
+		return errors.New("timeout must be greater than 0")
+	}
+	if cfg.RequestTimeout <= 0 {
+		return errors.New("request-timeout must be greater than 0")
+	}
+	if cfg.RequestTimeout > cfg.Timeout {
+		return errors.New("request-timeout cannot be greater than overall timeout")
+	}
+
+	// Validate concurrency
+	if cfg.MaxParallel <= 0 {
+		return errors.New("max-parallel must be greater than 0")
+	}
+	if cfg.MaxParallel > 100 {
+		return errors.New("max-parallel cannot exceed 100 (safety limit)")
+	}
+
+	// Validate output formats
+	validFormats := map[string]bool{"html": true, "csv": true, "json": true}
+	for _, format := range cfg.OutputFormats {
+		if !validFormats[strings.ToLower(format)] {
+			return fmt.Errorf("invalid output format: %s (valid: html, csv, json)", format)
+		}
+	}
+
+	// Validate severity filter
+	validSeverities := map[string]bool{"FAIL": true, "WARN": true, "ERR": true, "INFO": true}
+	for _, sev := range cfg.SeverityFilter {
+		if !validSeverities[strings.ToUpper(sev)] {
+			return fmt.Errorf("invalid severity: %s (valid: FAIL, WARN, ERR, INFO)", sev)
+		}
+	}
+
+	// Validate email settings if enabled
+	if cfg.EmailEnabled {
+		if cfg.SMTPServer == "" {
+			return errors.New("smtp-server is required when email is enabled")
+		}
+		if cfg.EmailFrom == "" {
+			return errors.New("email-from is required when email is enabled")
+		}
+		if len(cfg.EmailTo) == 0 {
+			return errors.New("email-to is required when email is enabled")
+		}
+		if cfg.SMTPPort <= 0 || cfg.SMTPPort > 65535 {
+			return errors.New("smtp-port must be between 1 and 65535")
+		}
+
+		if err := validateEmailAddress(cfg.EmailFrom); err != nil {
+			return fmt.Errorf("invalid email-from: %w", err)
+		}
+		for i, to := range cfg.EmailTo {
+			if err := validateEmailAddress(to); err != nil {
+				return fmt.Errorf("invalid email-to[%d]: %w", i, err)
+			}
+		}
+	}
+
+	// Validate webhook if enabled
+	if cfg.WebhookEnabled {
+		if err := validateURL(cfg.WebhookURL); err != nil {
+			return fmt.Errorf("invalid webhook-url: %w", err)
+		}
+	}
+
+	// Validate Slack if enabled
+	if cfg.SlackEnabled {
+		if err := validateURL(cfg.SlackWebhookURL); err != nil {
+			return fmt.Errorf("invalid slack-webhook-url: %w", err)
+		}
+	}
+
+	// Validate retry settings
+	if cfg.RetryMaxAttempts <= 0 {
+		return errors.New("retry-max-attempts must be greater than 0")
+	}
+	if cfg.RetryMaxAttempts > 50 {
+		return errors.New("retry-max-attempts cannot exceed 50 (safety limit)")
+	}
+	if cfg.RetryBaseDelay <= 0 {
+		return errors.New("retry-base-delay must be greater than 0")
+	}
+	if cfg.RetryMaxDelay <= 0 {
+		return errors.New("retry-max-delay must be greater than 0")
+	}
+	if cfg.RetryBaseDelay > cfg.RetryMaxDelay {
+		return errors.New("retry-base-delay cannot be greater than retry-max-delay")
+	}
+
+	// Security warning for insecure skip verify
+	if cfg.InsecureSkipVerify {
+		log.Warn().Msg("WARNING: TLS verification is disabled. This should only be used in trusted lab environments")
+	}
+
+	return nil
+}
+
+// maskPassword returns a masked version of password for logging
+func maskPassword(pwd string) string {
+	if pwd == "" {
+		return "(empty)"
+	}
+	if len(pwd) <= 4 {
+		return "****"
+	}
+	return pwd[:2] + "****" + pwd[len(pwd)-2:]
 }
 
 func writeDummyConfig(path string) error {
@@ -394,69 +684,85 @@ func bindConfig() (Config, error) {
 	viper.AutomaticEnv()
 
 	cfg := Config{
-		Clusters:           splitCSV(viper.GetString("clusters")),
-		Username:           viper.GetString("username"),
-		Password:           viper.GetString("password"),
-		InsecureSkipVerify: viper.GetBool("insecure-skip-verify"),
-		Timeout:            mustParseDur(viper.GetString("timeout"), 15*time.Minute),
-		RequestTimeout:     mustParseDur(viper.GetString("request-timeout"), 20*time.Second),
-		PollInterval:       mustParseDur(viper.GetString("poll-interval"), 15*time.Second),
-		PollJitter:         mustParseDur(viper.GetString("poll-jitter"), 2*time.Second),
-		OutputDirLogs:      viper.GetString("output-dir-logs"),
-		OutputDirFiltered:  viper.GetString("output-dir-filtered"),
-		OutputFormats:      splitCSV(viper.GetString("outputs")),
-		MaxParallel:        viper.GetInt("max-parallel"),
-		TLSMinVersion:      tls.VersionTLS12,
-		LogFile:            viper.GetString("log-file"),
-		LogLevel:           viper.GetString("log-level"),
-		LogHTTP:            viper.GetBool("log-http"),
-		RetryMaxAttempts:   viper.GetInt("retry-max-attempts"),
-		RetryBaseDelay:     mustParseDur(viper.GetString("retry-base-delay"), 400*time.Millisecond),
-		RetryMaxDelay:      mustParseDur(viper.GetString("retry-max-delay"), 8*time.Second),
-		EmailEnabled:       viper.GetBool("email-enabled"),
-		SMTPServer:         viper.GetString("smtp-server"),
-		SMTPPort:           viper.GetInt("smtp-port"),
-		SMTPUser:           viper.GetString("smtp-user"),
-		SMTPPassword:       viper.GetString("smtp-password"),
-		EmailFrom:          viper.GetString("email-from"),
-		EmailTo:            splitCSV(viper.GetString("email-to")),
-		EmailUseTLS:        viper.GetBool("email-use-tls"),
-		WebhookEnabled:     viper.GetBool("webhook-enabled"),
-		WebhookURL:         viper.GetString("webhook-url"),
-		WebhookHeaders:     viper.GetStringMapString("webhook-headers"),
+		Clusters:            splitCSV(viper.GetString("clusters")),
+		Username:            viper.GetString("username"),
+		Password:            viper.GetString("password"),
+		InsecureSkipVerify:  viper.GetBool("insecure-skip-verify"),
+		Timeout:             mustParseDur(viper.GetString("timeout"), defaultTimeout),
+		RequestTimeout:      mustParseDur(viper.GetString("request-timeout"), defaultRequestTimeout),
+		PollInterval:        mustParseDur(viper.GetString("poll-interval"), defaultPollInterval),
+		PollJitter:          mustParseDur(viper.GetString("poll-jitter"), defaultPollJitter),
+		OutputDirLogs:       viper.GetString("output-dir-logs"),
+		OutputDirFiltered:   viper.GetString("output-dir-filtered"),
+		OutputFormats:       splitCSV(viper.GetString("outputs")),
+		MaxParallel:         viper.GetInt("max-parallel"),
+		TLSMinVersion:       tls.VersionTLS12,
+		LogFile:             viper.GetString("log-file"),
+		LogLevel:            viper.GetString("log-level"),
+		LogHTTP:             viper.GetBool("log-http"),
+		RetryMaxAttempts:    viper.GetInt("retry-max-attempts"),
+		RetryBaseDelay:      mustParseDur(viper.GetString("retry-base-delay"), defaultRetryBaseDelay),
+		RetryMaxDelay:       mustParseDur(viper.GetString("retry-max-delay"), defaultRetryMaxDelay),
+		MaxIdleConns:        viper.GetInt("max-idle-conns"),
+		MaxIdleConnsPerHost: viper.GetInt("max-idle-conns-per-host"),
+		MaxConnsPerHost:     viper.GetInt("max-conns-per-host"),
+		IdleConnTimeout:     mustParseDur(viper.GetString("idle-conn-timeout"), defaultIdleConnTimeout),
+		EmailEnabled:        viper.GetBool("email-enabled"),
+		SMTPServer:          viper.GetString("smtp-server"),
+		SMTPPort:            viper.GetInt("smtp-port"),
+		SMTPUser:            viper.GetString("smtp-user"),
+		SMTPPassword:        viper.GetString("smtp-password"),
+		EmailFrom:           viper.GetString("email-from"),
+		EmailTo:             splitCSV(viper.GetString("email-to")),
+		EmailUseTLS:         viper.GetBool("email-use-tls"),
+		WebhookEnabled:      viper.GetBool("webhook-enabled"),
+		WebhookURL:          viper.GetString("webhook-url"),
+		WebhookHeaders:      viper.GetStringMapString("webhook-headers"),
+		SeverityFilter:      splitCSV(viper.GetString("severity-filter")),
+		DryRun:              viper.GetBool("dry-run"),
+		SlackEnabled:        viper.GetBool("slack-enabled"),
+		SlackWebhookURL:     viper.GetString("slack-webhook-url"),
+		SlackChannel:        viper.GetString("slack-channel"),
 	}
+	// Apply defaults
 	if cfg.OutputDirLogs == "" {
-		cfg.OutputDirLogs = "nccfiles"
+		cfg.OutputDirLogs = defaultOutputDirLogs
 	}
 	if cfg.OutputDirFiltered == "" {
-		cfg.OutputDirFiltered = "outputfiles"
+		cfg.OutputDirFiltered = defaultOutputDirFiltered
 	}
 	if len(cfg.OutputFormats) == 0 {
-		cfg.OutputFormats = []string{"html"}
+		cfg.OutputFormats = []string{defaultOutputFormat}
 	}
 	if cfg.MaxParallel <= 0 {
-		cfg.MaxParallel = 4
+		cfg.MaxParallel = defaultMaxParallel
 	}
 	if cfg.LogFile == "" {
-		cfg.LogFile = "logs/ncc-runner.log"
+		cfg.LogFile = defaultLogFile
 	}
 	cfg.PromDir = viper.GetString("prom-dir")
 	if cfg.PromDir == "" {
-		cfg.PromDir = "promfiles"
+		cfg.PromDir = defaultPromDir
 	}
 	if cfg.RetryMaxAttempts <= 0 {
-		cfg.RetryMaxAttempts = 6
+		cfg.RetryMaxAttempts = defaultRetryAttempts
 	}
 	if cfg.RetryBaseDelay <= 0 {
-		cfg.RetryBaseDelay = 400 * time.Millisecond
+		cfg.RetryBaseDelay = defaultRetryBaseDelay
 	}
 	if cfg.RetryMaxDelay <= 0 {
-		cfg.RetryMaxDelay = 8 * time.Second
+		cfg.RetryMaxDelay = defaultRetryMaxDelay
 	}
+
+	// Validate configuration
+	if err := validateConfig(cfg); err != nil {
+		return cfg, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
 	return cfg, nil
 }
 
-/************** Logging **************/
+// ==================== Logging ====================
 
 // In setupFileLogger, add the new version fields to the global logger context
 func setupFileLogger(logPath string, lvl zerolog.Level) error {
@@ -496,7 +802,7 @@ func setupFileLogger(logPath string, lvl zerolog.Level) error {
 	return nil
 }
 
-/************** Retry helpers **************/
+// ==================== Retry Helpers ====================
 
 func jitteredBackoff(base, maxDelay time.Duration, attempt int) time.Duration {
 	exp := float64(base) * math.Pow(2, float64(attempt-1))
@@ -540,7 +846,7 @@ func retryAfterDelay(resp *http.Response) (time.Duration, bool) {
 	return 0, false
 }
 
-/************** HTTP and FS **************/
+// ==================== HTTP Client and File System ====================
 
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -588,6 +894,20 @@ func (t *LoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 func NewHTTPClient(cfg Config) *http.Client {
+	// Apply defaults for connection pooling
+	maxIdleConns := cfg.MaxIdleConns
+	if maxIdleConns <= 0 {
+		maxIdleConns = defaultMaxIdleConns
+	}
+	maxIdleConnsPerHost := cfg.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+	}
+	idleConnTimeout := cfg.IdleConnTimeout
+	if idleConnTimeout <= 0 {
+		idleConnTimeout = defaultIdleConnTimeout
+	}
+
 	tr := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -600,20 +920,25 @@ func NewHTTPClient(cfg Config) *http.Client {
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
 			MinVersion:         cfg.TLSMinVersion,
 		},
-		IdleConnTimeout: 90 * time.Second,
-		MaxIdleConns:    100,
+		// Production-ready connection pooling
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     cfg.MaxConnsPerHost, // 0 = unlimited
+		IdleConnTimeout:     idleConnTimeout,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true, // Enable HTTP/2 for better performance
 	}
 	rt := http.RoundTripper(tr)
 	if cfg.LogHTTP || os.Getenv("LOG_HTTP") == "1" {
 		rt = &LoggingTransport{Base: tr, MaxBody: 64 * 1024}
 	}
 	return &http.Client{
-		Timeout:   cfg.Timeout, // overall guard
+		Timeout:   cfg.RequestTimeout, // Use request timeout, not overall timeout
 		Transport: rt,
 	}
 }
 
-/************** FS **************/
+// ==================== File System Interface ====================
 
 type FS interface {
 	MkdirAll(path string, perm os.FileMode) error
@@ -633,7 +958,7 @@ func (OSFS) ReadFile(path string) ([]byte, error)       { return os.ReadFile(pat
 func (OSFS) ReadDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
 func (OSFS) Create(path string) (*os.File, error)       { return os.Create(path) }
 
-/************** Prometheus metrics **************/
+// ==================== Prometheus Metrics ====================
 // sanitizeLabel ensures Prometheus label values are safe-ish (no newlines, quotes escaped).
 func sanitizeLabel(s string) string {
 	s = strings.TrimSpace(s)
@@ -710,7 +1035,7 @@ func writePrometheusFile(fs FS, promDir, cluster string, blocks []ParsedBlock) e
 	return fs.WriteFile(filename, []byte(b.String()), 0644)
 }
 
-/************** API Types **************/
+// ==================== API Types ====================
 
 type TaskStatus struct {
 	PercentageComplete int    `json:"percentage_complete"`
@@ -721,7 +1046,7 @@ type NCCSummary struct {
 	RunSummary string `json:"runSummary"`
 }
 
-/************** Parser **************/
+// ==================== Parser ====================
 
 var (
 	reBlockStart = regexp.MustCompile(`^Detailed information for .*`)
@@ -825,7 +1150,7 @@ func parseNCCHeader(path string) (HTMLMeta, error) {
 	return meta, nil
 }
 
-/************** Email-Notify **************/
+// ==================== Email Notifications ====================
 
 func sendEmail(cfg Config, subj string, body string) error {
 	if !cfg.EmailEnabled || cfg.SMTPServer == "" || len(cfg.EmailTo) == 0 {
@@ -879,7 +1204,7 @@ func sendEmail(cfg Config, subj string, body string) error {
 	return smtp.SendMail(addr, auth, cfg.EmailFrom, cfg.EmailTo, msg.Bytes())
 }
 
-/************** Webhook-Notify **************/
+// ==================== Webhook Notifications ====================
 
 func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary NotificationSummary) error {
 	if !cfg.WebhookEnabled || cfg.WebhookURL == "" {
@@ -941,18 +1266,105 @@ func sendWebhook(ctx context.Context, client HTTPClient, cfg Config, summary Not
 	return fmt.Errorf("webhook exhausted retries")
 }
 
-/************** Renderers **************/
+// ==================== Slack Notifications ====================
+
+func sendSlack(ctx context.Context, client HTTPClient, cfg Config, summary NotificationSummary) error {
+	if !cfg.SlackEnabled || cfg.SlackWebhookURL == "" {
+		return nil
+	}
+
+	// Determine color based on severity
+	color := "#36a64f" // green
+	if summary.FailCount > 0 {
+		color = "#ff0000" // red
+	} else if summary.WarnCount > 0 {
+		color = "#ffaa00" // orange
+	}
+
+	// Build Slack message
+	attachment := map[string]interface{}{
+		"color": color,
+		"title": fmt.Sprintf("NCC Report: %s", summary.Cluster),
+		"fields": []map[string]string{
+			{"title": "FAIL", "value": fmt.Sprintf("%d", summary.FailCount), "short": "true"},
+			{"title": "WARN", "value": fmt.Sprintf("%d", summary.WarnCount), "short": "true"},
+			{"title": "ERR", "value": fmt.Sprintf("%d", summary.ErrCount), "short": "true"},
+			{"title": "INFO", "value": fmt.Sprintf("%d", summary.InfoCount), "short": "true"},
+			{"title": "Total Checks", "value": fmt.Sprintf("%d", summary.TotalChecks), "short": "false"},
+		},
+		"footer": "NCC Orchestrator",
+		"ts":     summary.FinishedAt.Unix(),
+	}
+
+	payload := map[string]interface{}{
+		"attachments": []map[string]interface{}{attachment},
+	}
+
+	if cfg.SlackChannel != "" {
+		payload["channel"] = cfg.SlackChannel
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal slack payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.SlackWebhookURL, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Simple retry loop
+	for attempt := 1; attempt <= cfg.RetryMaxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == cfg.RetryMaxAttempts {
+				return fmt.Errorf("slack request failed: %w", err)
+			}
+		} else {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			if !isRetryableStatus(resp.StatusCode) || attempt == cfg.RetryMaxAttempts {
+				return fmt.Errorf("slack status %d", resp.StatusCode)
+			}
+		}
+		backoff := jitteredBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, attempt)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return fmt.Errorf("slack exhausted retries")
+}
+
+// ==================== Report Renderers ====================
 
 // func generateHTMLNoMeta(fs FS, rows []Row, filename string) error {
 // 	return generateHTML(fs, rows, filename, HTMLMeta{})
 // }
 
 func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
-	const tmpl = `
-<html>
+	if err := fs.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return err
+	}
+	const tmpl = `<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NCC Report - {{.Meta.ClusterName}}</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
   <style>
     :root {
       --fail: #ef4444;
@@ -963,9 +1375,37 @@ func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
       --thead: #f3f4f6;
     }
     * { box-sizing: border-box; }
-    body { margin: 16px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color: #111827; }
-    h1 { margin: 0 0 8px 0; font-size: 20px; }
-    .meta { color: #6b7280; font-size: 12px; margin-bottom: 12px; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #111827;
+      background: #f9fafb;
+    }
+    .page { max-width: 1100px; margin: 24px auto; padding: 0 16px 24px; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 16px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 22px; }
+    .subtitle { margin-top: 4px; font-size: 13px; color: #6b7280; }
+    .summary-line { font-size: 13px; color: #6b7280; margin-top: 6px; }
+    .summary-line strong { color: #111827; }
+    .tags { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .tag {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+      display: inline-flex;
+      gap: 4px;
+    }
+    .tag .label { color: #6b7280; }
+    .tag .value { font-weight: 600; color: #111827; }
     table { border-collapse: collapse; width: 100%; border: 1px solid var(--border); }
     thead th {
       position: sticky; top: 0; background: var(--thead);
@@ -980,59 +1420,6 @@ func generateHTML(fs FS, rows []Row, filename string, meta HTMLMeta) error {
     .sev.INFO { color: #fff; background: var(--info); }
     .sev.ERR  { color: #111827; background: #e5e7eb; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
-
-	body {
-  margin: 0;
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  color: #111827;
-  background: #f9fafb;
-}
-.page {
-  max-width: 1100px;
-  margin: 24px auto;
-  padding: 0 16px 24px;
-}
-.header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-h1 {
-  margin: 0;
-  font-size: 22px;
-}
-.subtitle {
-  margin-top: 4px;
-  font-size: 13px;
-  color: #6b7280;
-}
-.tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: flex-end;
-}
-.tag {
-  background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 999px;
-  padding: 4px 10px;
-  font-size: 11px;
-  display: inline-flex;
-  gap: 4px;
-}
-.tag .label {
-  color: #6b7280;
-}
-.tag .value {
-  font-weight: 600;
-  color: #111827;
-}
-
-/* keep your existing table / sev / mono styles */
-
   </style>
 </head>
 <body>
@@ -1041,50 +1428,39 @@ h1 {
       <div>
         <h1>NCC Report</h1>
         <div class="subtitle">{{.Meta.ClusterName}}</div>
+        <div class="summary-line">
+          {{.Summary.FAIL}} FAIL, {{.Summary.WARN}} WARN, {{.Summary.ERR}} ERR, {{.Summary.INFO}} INFO
+        </div>
       </div>
       <div class="tags">
-        <div class="tag">
-          <span class="label">Cluster</span>
-          <span class="value">{{.Meta.ClusterName}}</span>
-        </div>
-        <div class="tag">
-          <span class="label">Cluster Version</span>
-          <span class="value">{{.Meta.ClusterVersion}}</span>
-        </div>
-        <div class="tag">
-          <span class="label">NCC Version</span>
-          <span class="value">{{.Meta.NCCVersion}}</span>
-        </div>
-        <div class="tag">
-          <span class="label">Generated</span>
-          <span class="value">{{.Now}}</span>
-        </div>
+        <div class="tag"><span class="label">Cluster</span><span class="value">{{.Meta.ClusterName}}</span></div>
+        <div class="tag"><span class="label">Cluster Version</span><span class="value">{{.Meta.ClusterVersion}}</span></div>
+        <div class="tag"><span class="label">NCC Version</span><span class="value">{{.Meta.NCCVersion}}</span></div>
+        <div class="tag"><span class="label">Generated</span><span class="value">{{.Now}}</span></div>
       </div>
     </header>
-
     <main>
       <table>
         <thead>
-        <tr>
-          <th style="width:110px">Severity</th>
-          <th style="width:320px">NCC Check Name</th>
-          <th>Detail Information</th>
-        </tr>
+          <tr>
+            <th style="width:110px">Severity</th>
+            <th style="width:320px">NCC Check Name</th>
+            <th>Detail Information</th>
+          </tr>
         </thead>
         <tbody>
         {{range .Rows}}
-        <tr>
-          <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
-          <td class="mono">{{.CheckName}}</td>
-          <td class="mono">{{.Detail}}</td>
-        </tr>
+          <tr>
+            <td><span class="sev {{.Severity}}">{{.Severity}}</span></td>
+            <td class="mono">{{.CheckName}}</td>
+            <td class="mono">{{.Detail}}</td>
+          </tr>
         {{end}}
         </tbody>
       </table>
     </main>
   </div>
 </body>
-
 </html>`
 	f, err := fs.Create(filename)
 	if err != nil {
@@ -1092,10 +1468,24 @@ h1 {
 	}
 	defer f.Close()
 
+	sum := SummaryCounts{}
+	for _, r := range rows {
+		switch r.Severity {
+		case "FAIL":
+			sum.FAIL++
+		case "WARN":
+			sum.WARN++
+		case "ERR":
+			sum.ERR++
+		default:
+			sum.INFO++
+		}
+	}
 	data := HTMLData{
-		Rows: rows,
-		Now:  time.Now().Format(time.RFC3339),
-		Meta: meta,
+		Rows:    rows,
+		Now:     time.Now().Format(time.RFC3339),
+		Meta:    meta,
+		Summary: sum,
 	}
 	t := template.Must(template.New("table").Parse(tmpl))
 	return t.Execute(f, data)
@@ -1120,6 +1510,83 @@ func generateCSV(fs FS, blocks []ParsedBlock, filename string) error {
 	return w.Error()
 }
 
+type JSONOutput struct {
+	GeneratedAt string      `json:"generated_at"`
+	Checks      []JSONCheck `json:"checks"`
+	Summary     JSONSummary `json:"summary"`
+}
+
+type JSONCheck struct {
+	Severity  string `json:"severity"`
+	CheckName string `json:"check_name"`
+	Detail    string `json:"detail"`
+}
+
+type JSONSummary struct {
+	Total int            `json:"total"`
+	Count map[string]int `json:"count"`
+}
+
+func generateJSON(fs FS, blocks []ParsedBlock, filename string, meta HTMLMeta) error {
+	if err := fs.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return err
+	}
+	f, err := fs.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
+	checks := make([]JSONCheck, 0, len(blocks))
+	for _, b := range blocks {
+		sev := b.Severity
+		if sev == "" {
+			sev = "INFO"
+		}
+		counts[sev]++
+		checks = append(checks, JSONCheck{
+			Severity:  sev,
+			CheckName: b.CheckName,
+			Detail:    b.DetailRaw,
+		})
+	}
+
+	output := JSONOutput{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Checks:      checks,
+		Summary: JSONSummary{
+			Total: len(blocks),
+			Count: counts,
+		},
+	}
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(output)
+}
+
+func filterBlocksBySeverity(blocks []ParsedBlock, allowedSeverities []string) []ParsedBlock {
+	if len(allowedSeverities) == 0 {
+		return blocks
+	}
+	allowed := make(map[string]bool)
+	for _, s := range allowedSeverities {
+		allowed[strings.ToUpper(strings.TrimSpace(s))] = true
+	}
+	filtered := make([]ParsedBlock, 0, len(blocks))
+	for _, b := range blocks {
+		sev := b.Severity
+		if sev == "" {
+			sev = "INFO"
+		}
+		if allowed[sev] {
+			filtered = append(filtered, b)
+		}
+	}
+	return filtered
+}
+
 func rowsFromBlocks(blocks []ParsedBlock) []Row {
 	rows := make([]Row, 0, len(blocks))
 	for _, b := range blocks {
@@ -1133,7 +1600,49 @@ func rowsFromBlocks(blocks []ParsedBlock) []Row {
 	return rows
 }
 
-/************** Aggregation **************/
+// ==================== Aggregation ====================
+
+// generateTestAgg produces a test index.html with n clusters and ~10–15 rows per cluster for scalability testing.
+func generateTestAgg(n int, outDir string) error {
+	severities := []string{"FAIL", "WARN", "ERR", "INFO"}
+	checks := []string{
+		"AHV host time sync", "CVM memory", "Disk health", "Network connectivity",
+		"Storage pool", "Prism connectivity", "NCC version", "Cluster health",
+		"Data resilience", "VM placement", "Controller VM", "License validity",
+	}
+	agg := make([]AggBlock, 0, n*12)
+	clusterFiles := make([]struct{ Cluster, HTML, CSV string }, 0, n)
+	for i := 1; i <= n; i++ {
+		cluster := fmt.Sprintf("10.0.%d.%d", (i-1)/255, (i-1)%255+1)
+		clusterName := fmt.Sprintf("cluster-%03d", i)
+		clusterVersion := "6.5.2"
+		nccVersion := "4.2.0"
+		clusterFiles = append(clusterFiles, struct{ Cluster, HTML, CSV string }{
+			Cluster: cluster,
+			HTML:    cluster + ".html",
+			CSV:     cluster + ".csv",
+		})
+		numChecks := 8 + (i % 8)
+		for j := 0; j < numChecks; j++ {
+			sev := severities[(i+j)%len(severities)]
+			check := checks[j%len(checks)]
+			agg = append(agg, AggBlock{
+				Cluster:        cluster,
+				Severity:       sev,
+				Check:          check,
+				Detail:         fmt.Sprintf("Test detail for %s on %s. See https://portal.nutanix.com/kb/%d for more.", check, clusterName, 1000+i+j),
+				ClusterName:    clusterName,
+				ClusterVersion: clusterVersion,
+				NCCVersion:     nccVersion,
+			})
+		}
+	}
+	fs := OSFS{}
+	if err := writeAggregatedHTMLSingle(fs, outDir, agg, clusterFiles); err != nil {
+		return err
+	}
+	return nil
+}
 
 type AggBlock struct {
 	Cluster        string
@@ -1151,13 +1660,13 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
 	}
 	path := filepath.Join(outDir, "index.html")
 	abs, _ := filepath.Abs(path)
-	const tmpl = `
-	<html>
-	<head>
+	const tmpl = `<!DOCTYPE html>
+<html lang="en">
+<head>
 	<meta charset="utf-8">
-  	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>NCC Aggregated Report</title>
-	  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
+	<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iOCIgZmlsbD0iIzBmMTcyYSIvPgo8Y2lyY2xlIGN4PSI5IiBjeT0iMTMiIHI9IjMiIGZpbGw9IiNlZjQ0NDQiLz4KPGNpcmNsZSBjeD0iMjMiIGN5PSIxOSIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPgo8cGF0aCBkPSJNOSAyNCBMMTYgMjQgTTE2IDI0IEwyMyAyNCIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K">
 	<style>
 	:root {
 	  --bg: #0f172a;
@@ -1184,9 +1693,11 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
     background-color: var(--row1);
 	}
 	.container { max-width: 1400px; margin: 0 auto; padding: 7px 12px; }
-	.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+	.header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+	.title { flex: 1; min-width: 0; }
 	.title h1 { margin: 0; font-size: 22px; font-weight: 700; }
-	.title .sub { color: var(--muted); font-size: 12px; }
+	.title .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+	.header-actions { flex-shrink: 0; }
 	.controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0 18px 0; }
 	.control { background: #0d152b; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; gap: 8px; align-items: center; }
 	.control label { font-size: 12px; color: var(--muted); margin-right: 6px; }
@@ -1474,6 +1985,17 @@ func writeAggregatedHTMLSingle(fs FS, outDir string, rows []AggBlock, perCluster
   background: rgba(37, 99, 235, 0.2);
   color: var(--accent);
 }
+.cluster-load-more {
+  width: 100%;
+  padding: 10px;
+  background: #0a1123;
+  border: 1px solid var(--border);
+  color: var(--accent);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cluster-load-more:hover { border-color: var(--accent); background: rgba(37,99,235,0.1); }
 
 .modal-buttons {
   display: flex;
@@ -1748,33 +2270,68 @@ button, .cluster-display, .cluster-toggle {
   }
 }
 
+*:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.skip-link { position: absolute; top: -40px; left: 8px; background: var(--accent); color: #fff; padding: 8px 12px; border-radius: 6px; z-index: 100; text-decoration: none; font-size: 14px; }
+.skip-link:focus { top: 8px; }
+.report-footer { font-size: 0.8125rem; color: var(--muted); margin-top: 16px; padding: 12px 0; border-top: 1px solid var(--border); }
+.sum-item.clickable { cursor: pointer; transition: background 0.15s, border-color 0.15s; }
+.sum-item.clickable:hover { background: #0d152b; border-color: var(--accent); }
+.sum-item.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.th-sort { cursor: pointer; user-select: none; }
+.th-sort:hover { color: var(--text); }
+.th-sort .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.7; }
+.table-info { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
+.pagination button { background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.pagination button:hover:not(:disabled) { border-color: var(--accent); }
+.pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
+.pagination-info { font-size: 12px; color: var(--muted); }
+.pagination-size { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.pagination-size select { background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 6px; font-size: 12px; }
+.empty-state { text-align: center; padding: 48px 16px; color: var(--muted); }
+.empty-state p { margin: 0 0 12px 0; font-size: 14px; }
+.per-cluster-btn { font-size: 12px; padding: 8px 14px; background: transparent; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: border-color 0.15s, color 0.15s; }
+.per-cluster-btn:hover { border-color: var(--accent); color: #93c5fd; }
+.per-cluster-btn::after { content: "↗"; font-size: 11px; opacity: 0.8; }
+.per-cluster-links { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.per-cluster-links a { font-size: 12px; padding: 4px 10px; background: #0a1123; border: 1px solid var(--border); border-radius: 6px; color: #93c5fd; text-decoration: none; }
+.per-cluster-links a:hover { border-color: var(--accent); background: rgba(37,99,235,0.1); }
+
 	</style>
 	<script>
 
 	const AGG = {{.JSON}};
+	var CLUSTER_LINKS = {{.ClusterLinksJSON}};
 
-	
-let state = {
+	let state = {
   sortKey: "severity",
   sortDir: "asc",
   filterSev: new Set(["FAIL","WARN","ERR","INFO"]),
   filterClusters: new Set(),
   search: "",
-  showClusterModal: false,   
-  allClusters: []            
+  showClusterModal: false,
+  allClusters: [],
+  pageSize: 100,
+  currentPage: 0,
+  filteredRows: [],
+  clusterModalSearch: "",
+  clusterListVisible: 100,
+  showPerClusterModal: false,
+  perClusterSearch: "",
+  perClusterListVisible: 50
 };
 	
 	const sevRank = { FAIL: 1, WARN: 2, ERR: 3, INFO: 4 };
 	let selIndex = -1;
 
 function init() {
-  console.log("AGG length:", AGG.length);
   initClusters();
   updateAndRender();
   document.addEventListener("keydown", onKey);
-  const statusEl = document.getElementById('clusterStatus');
+  var statusEl = document.getElementById('clusterStatus');
   if (statusEl) {
     statusEl.onclick = toggleClusterFilter;
+    statusEl.onkeydown = function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleClusterFilter(); } };
   }
 }
 
@@ -1798,11 +2355,15 @@ function updateClusterStatus() {
     text = 'No clusters selected';
     className = 'cluster-status cluster-status-empty';
   } else if (count === total && total > 0) {
-    text = 'All clusters selected (' + total + ')';
+    text = total > 1 ? 'All clusters (' + total + ')' : 'All clusters selected';
     className = 'cluster-status';
   } else {
-    const names = Array.from(state.filterClusters).slice(0, 2);
-    text = names.join(', ') + (count > 2 ? ' +' + (count-2) : '') + ' (' + count + '/' + total + ')';
+    if (total > 8) {
+      text = count + ' of ' + total + ' clusters selected';
+    } else {
+      const names = Array.from(state.filterClusters).slice(0, 2);
+      text = names.join(', ') + (count > 2 ? ' +' + (count - 2) : '') + ' (' + count + '/' + total + ')';
+    }
     className = 'cluster-status';
   }
   statusEl.textContent = text;
@@ -1846,17 +2407,20 @@ function toggleClusterFilter() {
 
 function showClusterModal() {
   if (document.getElementById('clusterModal')) return;
-  
+  state.clusterModalSearch = "";
+  state.clusterListVisible = 100;
   const modal = document.createElement('div');
   modal.id = 'clusterModal';
   modal.className = 'cluster-modal';
   modal.innerHTML = [
     '<div class="cluster-modal-content">',
-      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">',
+      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">',
         '<h3 style="margin: 0; font-size: 18px;">Select Clusters</h3>',
-        '<button type="button" onclick="toggleClusterFilter()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;">✕</button>',
+        '<button type="button" onclick="toggleClusterFilter()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;" aria-label="Close">✕</button>',
       '</div>',
+      '<div style="margin-bottom: 12px;"><input type="text" id="clusterModalSearch" placeholder="Filter clusters..." style="width:100%; background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 8px; font-size: 13px;" aria-label="Filter cluster list"></div>',
       '<div class="cluster-list" id="clusterList"></div>',
+      '<div id="clusterListMore" style="margin-top: 8px;"></div>',
       '<div class="modal-buttons">',
         '<button type="button" onclick="selectAllClusters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: #0a1123; color: var(--text);">Select All</button>',
         '<button type="button" onclick="clearAllClusters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: #0a1123; color: var(--text);">Clear All</button>',
@@ -1864,8 +2428,12 @@ function showClusterModal() {
       '</div>',
     '</div>'
   ].join('');
-  
   document.body.appendChild(modal);
+  var searchEl = document.getElementById('clusterModalSearch');
+  if (searchEl) {
+    searchEl.oninput = function() { state.clusterModalSearch = this.value.trim(); renderClusterList(); };
+    searchEl.onkeydown = function(e) { if (e.key === 'Escape') { this.value = ''; state.clusterModalSearch = ''; renderClusterList(); this.focus(); } };
+  }
   renderClusterList();
 }
 
@@ -1873,19 +2441,115 @@ function hideClusterModal() {
   const modal = document.getElementById('clusterModal');
   if (modal) modal.remove();
 }
+function showPerClusterModal() {
+  if (typeof CLUSTER_LINKS === 'undefined' || !CLUSTER_LINKS.length) return;
+  if (document.getElementById('perClusterModal')) return;
+  state.perClusterSearch = "";
+  state.perClusterListVisible = 50;
+  var modal = document.createElement('div');
+  modal.id = 'perClusterModal';
+  modal.className = 'cluster-modal';
+  modal.innerHTML = [
+    '<div class="cluster-modal-content" style="max-width: 560px;">',
+      '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">',
+        '<h3 style="margin: 0; font-size: 18px;">Per-cluster reports</h3>',
+        '<button type="button" onclick="hidePerClusterModal()" style="background: none; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer;" aria-label="Close">✕</button>',
+      '</div>',
+      '<div style="margin-bottom: 12px;"><input type="text" id="perClusterSearch" placeholder="Filter by cluster name or IP..." style="width:100%; background: #0a1123; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 8px; font-size: 13px;" aria-label="Filter per-cluster links"></div>',
+      '<div class="cluster-list" id="perClusterList"></div>',
+      '<div id="perClusterListMore" style="margin-top: 8px;"></div>',
+    '</div>'
+  ].join('');
+  document.body.appendChild(modal);
+  var searchEl = document.getElementById('perClusterSearch');
+  if (searchEl) {
+    searchEl.oninput = function() { state.perClusterSearch = this.value.trim(); renderPerClusterList(); };
+    searchEl.onkeydown = function(e) { if (e.key === 'Escape') { this.value = ''; state.perClusterSearch = ''; renderPerClusterList(); this.focus(); } };
+    searchEl.focus();
+  }
+  state.showPerClusterModal = true;
+  renderPerClusterList();
+}
+function hidePerClusterModal() {
+  var modal = document.getElementById('perClusterModal');
+  if (modal) modal.remove();
+  state.showPerClusterModal = false;
+}
+function renderPerClusterList() {
+  var list = document.getElementById('perClusterList');
+  var moreEl = document.getElementById('perClusterListMore');
+  if (!list || typeof CLUSTER_LINKS === 'undefined') return;
+  var needle = state.perClusterSearch.toLowerCase();
+  var filtered = needle ? CLUSTER_LINKS.filter(function(item) { return (item.Cluster || '').toLowerCase().indexOf(needle) !== -1; }) : CLUSTER_LINKS.slice();
+  var visible = filtered.slice(0, state.perClusterListVisible);
+  var items = visible.map(function(item) {
+    var name = escapeHtml(item.Cluster || '');
+    var href = escapeHtml(item.HTML || '#');
+    return '<a href="' + href + '" target="_blank" rel="noopener" class="cluster-item" style="display:block; text-decoration: none; color: inherit;">' + name + '</a>';
+  });
+  list.innerHTML = items.join('');
+  if (moreEl) {
+    var remaining = filtered.length - state.perClusterListVisible;
+    if (remaining > 0) {
+      moreEl.innerHTML = '<button type="button" class="cluster-load-more" onclick="state.perClusterListVisible += 50; renderPerClusterList();">Show more (' + remaining + ' remaining)</button>';
+      moreEl.style.display = 'block';
+    } else {
+      moreEl.innerHTML = '';
+      moreEl.style.display = 'none';
+    }
+  }
+}
 
 function renderClusterList() {
   const list = document.getElementById('clusterList');
+  const moreEl = document.getElementById('clusterListMore');
   if (!list) return;
-  
-  const items = state.allClusters.map(function(name) {
-    const active = state.filterClusters.has(name) ? 'active' : '';
-    const safeName = escapeHtml(name);
-    return '<div class="cluster-item ' + active + '" onclick="toggleCluster(\'' + safeName + '\')">' + safeName + '</div>';
+  var needle = state.clusterModalSearch.toLowerCase();
+  var filtered = needle ? state.allClusters.filter(function(name) { return name.toLowerCase().indexOf(needle) !== -1; }) : state.allClusters.slice();
+  var visible = filtered.slice(0, state.clusterListVisible);
+  var items = visible.map(function(name) {
+    var active = state.filterClusters.has(name) ? 'active' : '';
+    var safeName = escapeHtml(name);
+    var safeJs = jsStrEsc(name);
+    return '<div class="cluster-item ' + active + '" onclick="toggleCluster(\'' + safeJs + '\')">' + safeName + '</div>';
   });
   list.innerHTML = items.join('');
+  if (moreEl) {
+    var remaining = filtered.length - state.clusterListVisible;
+    if (remaining > 0) {
+      moreEl.innerHTML = '<button type="button" class="cluster-load-more" onclick="state.clusterListVisible += 100; renderClusterList();">Show more (' + remaining + ' remaining)</button>';
+      moreEl.style.display = 'block';
+    } else {
+      moreEl.innerHTML = '';
+      moreEl.style.display = 'none';
+    }
+  }
 }
 	
+	function filterBySev(sev) {
+	  if (sev === null) {
+	    state.filterSev = new Set(["FAIL","WARN","ERR","INFO"]);
+	  } else {
+	    state.filterSev = new Set([sev]);
+	  }
+	  document.querySelectorAll('.control input[type="checkbox"]').forEach(function(cb) {
+	    var m = (cb.getAttribute('onchange') || '').match(/'([^']+)'/);
+	    if (m) cb.checked = state.filterSev.has(m[1]);
+	  });
+	  updateAndRender();
+	}
+	function clearFilters() {
+	  state.search = "";
+	  var sb = document.getElementById("searchBox");
+	  if (sb) sb.value = "";
+	  state.filterClusters = new Set(state.allClusters);
+	  state.filterSev = new Set(["FAIL","WARN","ERR","INFO"]);
+	  document.querySelectorAll('.control input[type="checkbox"]').forEach(function(cb) { cb.checked = true; });
+	  renderClusterList();
+	  updateClusterStatus();
+	  updateAndRender();
+	  if (state.showClusterModal) { state.showClusterModal = false; hideClusterModal(); }
+	}
 	function setSev(checked, sev) {
 	  if (checked) state.filterSev.add(sev); else state.filterSev.delete(sev);
 	  updateAndRender();
@@ -1905,7 +2569,23 @@ function renderClusterList() {
 	function sortBy(key) {
 	  if (state.sortKey === key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
 	  else { state.sortKey = key; state.sortDir = "asc"; }
+	  updateSortIndicators();
 	  updateAndRender();
+	}
+	function updateSortIndicators() {
+	  document.querySelectorAll('.th-sort .sort-arrow').forEach(function(el) {
+	    var key = el.id ? el.id.replace('arrow-','') : '';
+	    if (key === 'clusterName') key = 'clusterName';
+	    if (key === 'cluster') key = 'cluster';
+	    if (key === 'severity') key = 'severity';
+	    if (key === 'check') key = 'check';
+	    el.textContent = state.sortKey === key ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+	  });
+	  var keys = ['clusterName','cluster','severity','check'];
+	  keys.forEach(function(key) {
+	    var el = document.getElementById('arrow-' + key);
+	    if (el) el.textContent = state.sortKey === key ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+	  });
 	}
 	
 function filterData() {
@@ -1951,7 +2631,7 @@ function updateCounts(rows) {
   document.getElementById("barErr").style.width  = pct.ERR  + "%";
   document.getElementById("barInfo").style.width = pct.INFO + "%";
 
-  <!-- const pc = document.getElementById("perCluster"); pc.innerHTML = ""; -->
+  // const pc = document.getElementById("perCluster"); pc.innerHTML = "";
 }
 
 
@@ -1972,6 +2652,10 @@ function updateCounts(rows) {
 	  return (s || "").toString()
 		.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
 		.replaceAll('"',"&quot;").replaceAll("'","&#39;");
+	}
+	function jsStrEsc(s) {
+	  return (s || "").toString()
+		.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\r/g, " ").replace(/\n/g, " ");
 	}
 	
 	function highlight(text, needle) {
@@ -2165,12 +2849,22 @@ function initTooltips() {
 	  if (k === "/") {
 		e.preventDefault();
 		const sb = document.getElementById("searchBox");
-		sb.focus(); sb.select();
+		if (sb) { sb.focus(); sb.select(); }
 		return;
 	  }
 	  if (k === "Escape") {
+		if (state.showPerClusterModal) {
+		  state.showPerClusterModal = false;
+		  hidePerClusterModal();
+		  return;
+		}
+		if (state.showClusterModal) {
+		  state.showClusterModal = false;
+		  hideClusterModal();
+		  return;
+		}
 		if (state.search) {
-		  state.search = ""; document.getElementById("searchBox").value = "";
+		  state.search = ""; var sb = document.getElementById("searchBox"); if (sb) sb.value = "";
 		  updateAndRender();
 		}
 		return;
@@ -2200,7 +2894,50 @@ function initTooltips() {
 	  
 	  updateCounts(rows);
 	  rows = sortData(rows.slice());
-	  renderTable(rows);
+	  state.filteredRows = rows;
+	  var totalRows = rows.length;
+	  var totalPages = state.pageSize > 0 ? Math.max(1, Math.ceil(totalRows / state.pageSize)) : 1;
+	  if (state.currentPage >= totalPages) state.currentPage = Math.max(0, totalPages - 1);
+	  var pageStart = state.currentPage * state.pageSize;
+	  var pageEnd = Math.min(pageStart + state.pageSize, totalRows);
+	  var pageRows = totalRows > 0 ? rows.slice(pageStart, pageEnd) : [];
+	  var infoEl = document.getElementById("tableInfo");
+	  var emptyEl = document.getElementById("emptyState");
+	  var tableEl = document.getElementById("main-table");
+	  var paginationEl = document.getElementById("pagination");
+	  if (infoEl) {
+	    if (totalRows === 0) infoEl.textContent = "Showing 0 rows";
+	    else if (totalRows <= state.pageSize) infoEl.textContent = "Showing " + totalRows + " row" + (totalRows === 1 ? "" : "s");
+	    else infoEl.textContent = "Showing " + (pageStart + 1) + "–" + pageEnd + " of " + totalRows + " rows";
+	  }
+	  if (emptyEl && tableEl) {
+	    if (totalRows === 0) { tableEl.style.display = "none"; emptyEl.style.display = "block"; if (paginationEl) paginationEl.style.display = "none"; }
+	    else { tableEl.style.display = ""; emptyEl.style.display = "none"; if (paginationEl) paginationEl.style.display = totalRows > state.pageSize ? "flex" : "none"; }
+	  }
+	  if (paginationEl && totalRows > state.pageSize) {
+	    paginationEl.innerHTML = '<button type="button" onclick="goToPage(' + (state.currentPage - 1) + ')" ' + (state.currentPage === 0 ? 'disabled' : '') + ' aria-label="Previous page">Prev</button>' +
+	      '<span class="pagination-info">Page ' + (state.currentPage + 1) + ' of ' + totalPages + '</span>' +
+	      '<button type="button" onclick="goToPage(' + (state.currentPage + 1) + ')" ' + (state.currentPage >= totalPages - 1 ? 'disabled' : '') + ' aria-label="Next page">Next</button>' +
+	      '<label class="pagination-size"><span>Rows</span><select id="pageSizeSelect" onchange="setPageSize(parseInt(this.value,10))">' +
+	      (state.pageSize === 50 ? '<option value="50" selected>50</option>' : '<option value="50">50</option>') +
+	      (state.pageSize === 100 ? '<option value="100" selected>100</option>' : '<option value="100">100</option>') +
+	      (state.pageSize === 200 ? '<option value="200" selected>200</option>' : '<option value="200">200</option>') +
+	      (state.pageSize === 500 ? '<option value="500" selected>500</option>' : '<option value="500">500</option>') +
+	      '</select></label>';
+	  }
+	  updateSortIndicators();
+	  var fc = document.getElementById("footerClusterCount");
+	  if (fc) fc.textContent = "Clusters: " + state.filterClusters.size + "/" + state.allClusters.length;
+	  renderTable(pageRows);
+	}
+	function goToPage(p) {
+	  state.currentPage = Math.max(0, Math.min(p, Math.ceil(state.filteredRows.length / state.pageSize) - 1));
+	  updateAndRender();
+	}
+	function setPageSize(n) {
+	  state.pageSize = n;
+	  state.currentPage = 0;
+	  updateAndRender();
 	}
 	
 	function downloadCSV() {
@@ -2236,95 +2973,82 @@ function initTooltips() {
 	</script>
 	</head>
 	<body onload="init()">
+	<a href="#main-table" class="skip-link">Skip to table</a>
 	<div class="container">
 	  <div class="header">
 		<div class="title">
 		  <h1>NCC Aggregated Report</h1>
-		  <div class="sub">Generated at {{.GeneratedAt}}</div>
+		  <div class="sub">Generated at {{.GeneratedAt}}{{if .Clusters}} · {{len .Clusters}} cluster{{if eq (len .Clusters) 1}}{{else}}s{{end}}{{end}}</div>
 		</div>
-        <!--
-        <div class="legend">
-          <span class="badge"><span class="dot fail"></span> FAIL</span>
-          <span class="badge"><span class="dot warn"></span> WARN</span>
-          <span class="badge"><span class="dot err"></span> ERR</span>
-          <span class="badge"><span class="dot info"></span> INFO</span>
-        </div>
-        -->
+		{{if .Clusters}}
+		<div class="header-actions">
+		  <button type="button" class="per-cluster-btn" onclick="showPerClusterModal()" aria-label="Open per-cluster report links">Per-cluster reports ({{len .Clusters}})</button>
+		</div>
+		{{end}}
 	  </div>
 	
 	  <div class="controls">
 		<div class="control">
-		  <label>Search</label>
-		  <input id="searchBox" type="text" placeholder="Type to filter..." oninput="onSearchDebounced(this)" />
+		  <label for="searchBox">Search</label>
+		  <input id="searchBox" type="text" placeholder="Type to filter..." oninput="onSearchDebounced(this)" aria-label="Filter rows by search text" />
 		</div>
 		<div class="control">
 		  <label>Severity</label>
-<label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'FAIL')">
-    <span style="color: var(--fail);">FAIL</span>
-  </label>
-  <label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'WARN')">
-    <span style="color: var(--warn);">WARN</span>
-  </label>
-    <label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'ERR')">
-    <span style="color: var(--err);">ERR</span>
-  </label>
-  <label>
-    <input type="checkbox" checked onchange="setSev(this.checked,'INFO')">
-    <span style="color: var(--info);">INFO</span>
-  </label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'FAIL')"> <span style="color: var(--fail);">FAIL</span></label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'WARN')"> <span style="color: var(--warn);">WARN</span></label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'ERR')"> <span style="color: var(--err);">ERR</span></label>
+		  <label><input type="checkbox" checked onchange="setSev(this.checked,'INFO')"> <span style="color: var(--info);">INFO</span></label>
 		</div>
 <div class="control">
-  <label>Clusters</label>
+  <label for="clusterStatus">Clusters</label>
   <div class="cluster-status-wrapper">
-    <div id="clusterStatus" class="cluster-status">All clusters selected (4)</div>
-    <!-- <button class="cluster-edit-btn" onclick="toggleClusterFilter()">⚙️ Edit</button> -->
+    <div id="clusterStatus" class="cluster-status" role="button" tabindex="0" aria-label="Select clusters to filter" aria-haspopup="dialog">All clusters selected</div>
   </div>
 </div>
 		<div class="control">
-		  <button onclick="downloadCSV()">Export CSV</button>
-		  <button onclick="downloadJSON()">Export JSON</button>
+		  <button type="button" onclick="downloadCSV()" aria-label="Export filtered rows as CSV">Export CSV</button>
+		  <button type="button" onclick="downloadJSON()" aria-label="Export filtered rows as JSON">Export JSON</button>
 		</div>
 	  </div>
 	
 	  <div class="summary">
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumTotal" role="button" tabindex="0" onclick="filterBySev(null)" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev(null); }" aria-label="Show all severities">
 		  <div class="label">Total</div>
 		  <div class="count" id="countTotal">0</div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumFail" role="button" tabindex="0" onclick="filterBySev('FAIL')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('FAIL'); }" aria-label="Show only FAIL">
 		  <div class="label">FAIL</div>
 		  <div class="count" id="countFail">0</div>
 		  <div class="progress fail"><span id="barFail" style="width:0%"></span></div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumWarn" role="button" tabindex="0" onclick="filterBySev('WARN')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('WARN'); }" aria-label="Show only WARN">
 		  <div class="label">WARN</div>
 		  <div class="count" id="countWarn">0</div>
 		  <div class="progress warn"><span id="barWarn" style="width:0%"></span></div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumErr" role="button" tabindex="0" onclick="filterBySev('ERR')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('ERR'); }" aria-label="Show only ERR">
 		  <div class="label">ERR</div>
 		  <div class="count" id="countErr">0</div>
 		  <div class="progress err"><span id="barErr" style="width:0%"></span></div>
 		</div>
-		<div class="sum-item">
+		<div class="sum-item clickable" id="sumInfo" role="button" tabindex="0" onclick="filterBySev('INFO')" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); filterBySev('INFO'); }" aria-label="Show only INFO">
 		  <div class="label">INFO</div>
 		  <div class="count" id="countInfo">0</div>
 		  <div class="progress info"><span id="barInfo" style="width:0%"></span></div>
 		</div>
 	  </div>
 	
+	  <div class="table-info" id="tableInfo">Showing 0 rows</div>
+	  <div id="pagination" class="pagination" style="display:none;"></div>
 	  <div class="card">
 		<div class="scroll">
-		  <table>
+		  <table id="main-table">
 			<thead>
 			  <tr>
-			  	<th class="col-cname" onclick="sortBy('clusterName')">Cluster Name</th>
-				<th class="col-cluster" onclick="sortBy('cluster')">Cluster</th>
-				<th class="col-sev" onclick="sortBy('severity')">Severity</th>
-				<th class="col-title" onclick="sortBy('check')">NCC Alert Title</th>
+			  	<th class="col-cname th-sort" data-sort="clusterName" onclick="sortBy('clusterName')">Cluster Name <span class="sort-arrow" id="arrow-clusterName"></span></th>
+				<th class="col-cluster th-sort" data-sort="cluster" onclick="sortBy('cluster')">Cluster <span class="sort-arrow" id="arrow-cluster"></span></th>
+				<th class="col-sev th-sort" data-sort="severity" onclick="sortBy('severity')">Severity <span class="sort-arrow" id="arrow-severity"></span></th>
+				<th class="col-title th-sort" data-sort="check" onclick="sortBy('check')">NCC Alert Title <span class="sort-arrow" id="arrow-check"></span></th>
 				<th class="col-kb">KB</th>
 				<th class="col-detail">Detail</th>
 				<th class="col-actions">Actions</th>
@@ -2332,25 +3056,16 @@ function initTooltips() {
 			</thead>
 			<tbody id="tbody"></tbody>
 		  </table>
+		  <div id="emptyState" class="empty-state" style="display:none;">
+		    <p>No rows match your filters.</p>
+		    <button type="button" onclick="clearFilters()">Clear filters</button>
+		  </div>
 		</div>
 	  </div>
 	
      <footer class="report-footer">
-    Keyboard: “/” to focus search, ↑/↓ to move, Esc to clear search. Full details visible in table.
+    <strong>Keyboard:</strong> / focus search · ↑/↓ move row · Esc clear search or close modal. <span id="footerClusterCount"></span>
 </footer>
-
-
-<style>
-    .report-footer {
-        font-size: 0.8125rem;
-        color: #666; /* Better contrast than #aaa */
-        margin-bottom: 0;
-        padding: 10px; /* Adds breathing room */
-        bottom: 0;
-        left: 0;
-        width: 100%;
-    }
-</style>
 	</div>
 	</body>
 	</html>`
@@ -2384,17 +3099,23 @@ function initTooltips() {
 		return fmt.Errorf("marshal agg json: %w", err)
 	}
 
+	clusterLinksJSON, _ := json.Marshal(perCluster)
+	if clusterLinksJSON == nil {
+		clusterLinksJSON = []byte("[]")
+	}
 	data := struct {
-		JSON           template.JS
-		Clusters       []struct{ Cluster, HTML, CSV string }
-		GeneratedAt    string
-		ClusterName    string
-		ClusterVersion string
-		NCCVersion     string
+		JSON             template.JS
+		ClusterLinksJSON template.JS
+		Clusters         []struct{ Cluster, HTML, CSV string }
+		GeneratedAt      string
+		ClusterName      string
+		ClusterVersion   string
+		NCCVersion       string
 	}{
-		JSON:        template.JS(jsonBytes),
-		Clusters:    perCluster,
-		GeneratedAt: time.Now().Format(time.RFC3339),
+		JSON:             template.JS(jsonBytes),
+		ClusterLinksJSON: template.JS(clusterLinksJSON),
+		Clusters:         perCluster,
+		GeneratedAt:      time.Now().Format(time.RFC3339),
 	}
 
 	f, err := fs.Create(path)
@@ -2410,7 +3131,7 @@ function initTooltips() {
 	return nil
 }
 
-/************** Retryable HTTP wrappers **************/
+// ==================== Retryable HTTP Wrappers ====================
 
 func doWithRetry(ctx context.Context, client HTTPClient, req *http.Request, cfg Config, op string) (*http.Response, []byte, error) {
 	attempts := cfg.RetryMaxAttempts
@@ -2523,7 +3244,7 @@ func doWithRetry(ctx context.Context, client HTTPClient, req *http.Request, cfg 
 	return resp, body, fmt.Errorf("%s exhausted retries", op)
 }
 
-/************** NCC Client **************/
+// ==================== NCC Client ====================
 
 type NCCClient struct {
 	baseURL string
@@ -2627,7 +3348,7 @@ func (c *NCCClient) GetRunSummary(ctx context.Context, taskID string) (NCCSummar
 	return summary, body, nil
 }
 
-/************** Orchestration with bars **************/
+// ==================== Orchestration ====================
 
 func sanitizeSummary(s string) string {
 	return strings.ReplaceAll(s, "\\n", "\n")
@@ -2699,8 +3420,8 @@ func runClusterWithBars(
 	for {
 		select {
 		case <-ctx.Done():
-			l.Error().Err(ctx.Err()).Msg("context done during polling")
-			return nil, ctx.Err()
+			l.Warn().Err(ctx.Err()).Msg("context cancelled during polling, stopping gracefully")
+			return nil, fmt.Errorf("operation cancelled: %w", ctx.Err())
 		case <-time.After(cfg.PollInterval + time.Duration(rand.Int63n(int64(cfg.PollJitter)))):
 			if dl, ok := ctx.Deadline(); ok {
 				rem := time.Until(dl)
@@ -2757,6 +3478,14 @@ SUMMARY:
 		return nil, err
 	}
 	l.Info().Str("filteredPath", filteredPath).Msg("filtered written")
+
+	// Apply severity filtering if configured
+	if len(cfg.SeverityFilter) > 0 {
+		originalCount := len(blocks)
+		blocks = filterBlocksBySeverity(blocks, cfg.SeverityFilter)
+		l.Info().Int("original", originalCount).Int("filtered", len(blocks)).Strs("severities", cfg.SeverityFilter).Msg("applied severity filter")
+	}
+
 	counts := map[string]int{"FAIL": 0, "WARN": 0, "ERR": 0, "INFO": 0}
 	for _, b := range blocks {
 		sev := b.Severity
@@ -2787,6 +3516,9 @@ SUMMARY:
 	}
 	if err := sendWebhook(ctx, httpc, cfg, summaryNotify); err != nil {
 		l.Error().Err(err).Msg("webhook failed")
+	}
+	if err := sendSlack(ctx, httpc, cfg, summaryNotify); err != nil {
+		l.Error().Err(err).Msg("slack notification failed")
 	}
 	l.Info().Int("fail", summaryNotify.FailCount).Int("warn", summaryNotify.WarnCount).Msg("notifications sent")
 
@@ -2821,6 +3553,15 @@ SUMMARY:
 				return nil, err
 			}
 			l.Info().Str("file", csvFile).Msg("CSV generated")
+		case "json":
+			jsonFile := base + ".json"
+			rawPath := filepath.Join(cfg.OutputDirLogs, fmt.Sprintf("%s.log", cluster))
+			meta, _ := parseNCCHeader(rawPath) // ignore error if file missing
+			if err := generateJSON(fs, blocks, jsonFile, meta); err != nil {
+				l.Error().Err(err).Str("file", jsonFile).Msg("write JSON failed")
+				return nil, err
+			}
+			l.Info().Str("file", jsonFile).Msg("JSON generated")
 		default:
 			l.Warn().Str("format", f).Msg("unknown output format")
 		}
@@ -2830,7 +3571,7 @@ SUMMARY:
 	return blocks, nil
 }
 
-/************** CLI **************/
+// ==================== CLI ====================
 
 type ClusterResult struct {
 	Cluster string
@@ -2868,7 +3609,7 @@ var (
 func init() {
 	// Defaults
 	if Version == "" {
-		Version = "0.1.10"
+		Version = "0.1.11"
 	}
 	if BuildDate == "" {
 		BuildDate = "unknown"
@@ -2927,19 +3668,49 @@ Stream: %s
 Build Date: %s
 Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Setup console logger first for early error visibility
+			consoleWriter := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}
+			consoleLogger := zerolog.New(consoleWriter).With().Timestamp().Logger()
+			zerolog.SetGlobalLevel(zerolog.InfoLevel)
+
+			// Generate test aggregated report (no config required)
+			if genN, _ := cmd.Flags().GetInt("gen-test-agg"); genN > 0 {
+				outDir := viper.GetString("output-dir-filtered")
+				if outDir == "" {
+					outDir = "outputfiles"
+				}
+				if err := generateTestAgg(genN, outDir); err != nil {
+					consoleLogger.Error().Err(err).Int("clusters", genN).Msg("gen-test-agg failed")
+					return fmt.Errorf("gen-test-agg: %w", err)
+				}
+				fmt.Printf("Generated test aggregated report: %d clusters, output in %s/index.html\n", genN, outDir)
+				return nil
+			}
 
 			cfg, err := bindConfig()
 			if err != nil {
-				return err
+				consoleLogger.Error().Err(err).Msg("configuration error")
+				return fmt.Errorf("configuration error: %w", err)
 			}
 
 			lvl := parseLogLevel(cfg.LogLevel)
+			// Validate log level
+			if lvl > zerolog.FatalLevel {
+				consoleLogger.Warn().Int("level", int(lvl)).Msg("invalid log level, using info level")
+				lvl = zerolog.InfoLevel
+			}
+
 			if err := setupFileLogger(cfg.LogFile, lvl); err != nil {
+				consoleLogger.Error().Err(err).Str("logFile", cfg.LogFile).Msg("failed to setup file logger")
 				return fmt.Errorf("setup logger: %w", err)
 			}
+
+			// Set global log level after file logger is set up
+			zerolog.SetGlobalLevel(lvl)
 			log.Info().
 				Strs("clusters", cfg.Clusters).
 				Str("username", cfg.Username).
+				Str("password", maskPassword(cfg.Password)).
 				Bool("insecureSkipVerify", cfg.InsecureSkipVerify).
 				Dur("timeout", cfg.Timeout).
 				Dur("requestTimeout", cfg.RequestTimeout).
@@ -2961,11 +3732,38 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				fmt.Print(termsText)
 				return nil
 			}
+			// Validate required fields first
 			if len(cfg.Clusters) == 0 {
-				return errors.New("no clusters provided (--clusters, env, or config)")
+				err := errors.New("no clusters provided (--clusters, env, or config)")
+				log.Error().Msg(err.Error())
+				return err
 			}
 			if cfg.Username == "" {
-				return errors.New("missing --username or config username")
+				err := errors.New("missing --username or config username")
+				log.Error().Msg(err.Error())
+				return err
+			}
+
+			// Dry-run mode: perform full validation and exit
+			if cfg.DryRun {
+				// Perform comprehensive validation for dry-run
+				if err := validateConfig(cfg); err != nil {
+					return fmt.Errorf("dry-run validation failed: %w", err)
+				}
+
+				log.Info().Msg("DRY-RUN MODE: Configuration validated, no checks will be executed")
+				fmt.Println("✓ Configuration is valid")
+				fmt.Printf("  Clusters: %d configured\n", len(cfg.Clusters))
+				fmt.Printf("  Username: %s\n", cfg.Username)
+				fmt.Printf("  Output formats: %v\n", cfg.OutputFormats)
+				if len(cfg.SeverityFilter) > 0 {
+					fmt.Printf("  Severity filter: %v\n", cfg.SeverityFilter)
+				}
+				if cfg.InsecureSkipVerify {
+					fmt.Println("  ⚠️  WARNING: TLS verification is disabled")
+				}
+				fmt.Println("  All settings validated successfully")
+				return nil
 			}
 
 			if envInfo, err := cmd.Flags().GetBool("env-info"); err == nil && envInfo {
@@ -2995,7 +3793,12 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 					envVar := "NCC_" + key
 					val := os.Getenv(envVar)
 					if val != "" {
-						fmt.Printf("%s = %s\n", envVar, val)
+						// Mask sensitive values
+						if key == "PASSWORD" || key == "SMTP_PASSWORD" {
+							fmt.Printf("%s = %s\n", envVar, maskPassword(val))
+						} else {
+							fmt.Printf("%s = %s\n", envVar, val)
+						}
 					} else {
 						fmt.Printf("%s = (not set)\n", envVar)
 					}
@@ -3154,9 +3957,38 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 			// Inside RunE, after setting up cfg, fs, httpc...
 			fmt.Println("You have accepted T&C, Check using --tc flag")
 
-			p := mpb.New(mpb.WithWidth(80)) // Removed invalid WithDebug
+			// Create root context with graceful shutdown support
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-			ctx := context.Background()
+			// Setup graceful shutdown signal handling
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+			go func() {
+				sig := <-sigChan
+				log.Warn().Str("signal", sig.String()).Msg("received shutdown signal, initiating graceful shutdown")
+				fmt.Fprintf(os.Stderr, "\n⚠️  Received %s signal. Initiating graceful shutdown...\n", sig.String())
+				cancel() // Cancel root context to stop all operations
+
+				// Give operations time to finish
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer shutdownCancel()
+
+				select {
+				case <-shutdownCtx.Done():
+					log.Warn().Msg("graceful shutdown timeout exceeded, forcing exit")
+					fmt.Fprintln(os.Stderr, "⚠️  Graceful shutdown timeout exceeded")
+					os.Exit(1)
+				case <-time.After(100 * time.Millisecond):
+					// Allow time for cleanup
+				}
+			}()
+
+			p := mpb.New(mpb.WithWidth(80))
+			defer func() {
+				// Ensure progress bars are cleaned up on exit
+				p.Wait()
+			}()
 			sem := make(chan struct{}, cfg.MaxParallel)
 			var wg sync.WaitGroup
 			results := make(chan ClusterResult, len(cfg.Clusters))
@@ -3217,7 +4049,14 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 						setPhase("failed")
 						phaseBar.SetCurrent(1)     // Set current to match total
 						phaseBar.SetTotal(1, true) // Complete phaseBar on error
-						log.Error().Str("cluster", cl).Err(err).Msg("cluster run failed")
+						// Log with detailed error information
+						log.Error().
+							Str("cluster", cl).
+							Err(err).
+							Str("error_type", fmt.Sprintf("%T", err)).
+							Msg("cluster run failed")
+						// Also print to console for visibility
+						fmt.Fprintf(os.Stderr, "\n❌ Cluster %s failed: %v\n", cl, err)
 						results <- ClusterResult{Cluster: cl, Blocks: nil, Err: err}
 						return
 					}
@@ -3232,8 +4071,33 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				}(cluster, mainBar, phaseProxy, phaseBar) // Pass phaseBar
 			}
 
-			// Wait for workers, close and drain results
-			wg.Wait()
+			// Wait for workers with context cancellation support
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// All workers completed normally
+			case <-ctx.Done():
+				// Context cancelled (shutdown signal received)
+				log.Warn().Msg("context cancelled, waiting for workers to finish")
+				fmt.Fprintln(os.Stderr, "⏳ Waiting for in-progress operations to complete...")
+				// Wait with timeout for workers to finish
+				waitCtx, waitCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer waitCancel()
+				select {
+				case <-done:
+					log.Info().Msg("all workers completed after cancellation")
+				case <-waitCtx.Done():
+					log.Error().Msg("timeout waiting for workers after cancellation")
+					fmt.Fprintln(os.Stderr, "❌ Timeout waiting for operations to complete")
+					return fmt.Errorf("graceful shutdown timeout: operations did not complete in time")
+				}
+			}
+
 			close(results)
 
 			var failed []string
@@ -3275,14 +4139,18 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 				log.Error().Err(err).Msg("write aggregated HTML failed")
 			}
 
-			// // Flush progress rendering
-			// log.Info().Msg("Before p.Wait()") // Temporary debug log
-			// p.Wait()
-			// log.Info().Msg("After p.Wait()") // Temporary debug log
+			// Check if context was cancelled during execution
+			if ctx.Err() != nil {
+				log.Warn().Err(ctx.Err()).Msg("operation cancelled during execution")
+				if len(failed) > 0 {
+					return fmt.Errorf("operation cancelled: %d clusters failed: %v", len(failed), failed)
+				}
+				return fmt.Errorf("operation cancelled: %w", ctx.Err())
+			}
 
 			if len(failed) > 0 {
 				log.Error().Strs("failedClusters", failed).Msg("some clusters failed")
-				return fmt.Errorf("some clusters failed: %v", failed) // Use this for the message; remove fmt.Printf
+				return fmt.Errorf("some clusters failed: %v", failed)
 			}
 
 			log.Info().Msg("all clusters processed successfully")
@@ -3306,9 +4174,11 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().String("poll-interval", "15s", "Polling interval for task status")
 	cmd.Flags().String("poll-jitter", "2s", "Additive jitter to polling interval")
 	cmd.Flags().Int("max-parallel", 4, "Max concurrent clusters")
-	cmd.Flags().String("outputs", "html,csv", "Comma-separated outputs: html,csv for per-cluster files")
+	cmd.Flags().String("outputs", "html,csv", "Comma-separated outputs: html,csv,json for per-cluster files")
 	cmd.Flags().String("output-dir-logs", "nccfiles", "Directory for raw logs")
 	cmd.Flags().String("output-dir-filtered", "outputfiles", "Directory for filtered and aggregated results")
+	cmd.Flags().String("severity-filter", "", "Comma-separated severities to include (FAIL,WARN,ERR,INFO). Empty = all")
+	cmd.Flags().Bool("dry-run", false, "Validate configuration without running checks")
 	cmd.Flags().String("log-file", "logs/ncc-runner.log", "Path to log file (rotated)")
 	cmd.Flags().String("log-level", "", "Log level (trace/debug/info/warn/error or 0..5)")
 	cmd.Flags().Bool("log-http", false, "Enable HTTP request/response dump logs")
@@ -3316,6 +4186,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().String("retry-base-delay", "400ms", "Base retry delay (with jitter, exponential)")
 	cmd.Flags().String("retry-max-delay", "8s", "Max retry delay cap")
 	cmd.Flags().Bool("replay", false, "Replay from existing logs without running NCC")
+	cmd.Flags().Int("gen-test-agg", 0, "Generate a test index.html with N clusters for scalability testing (no API calls)")
 	cmd.Flags().String("prom-dir", "promfiles", "Directory for Prometheus metrics")
 	cmd.Flags().Bool("email-enabled", false, "Enable email notifications")
 	cmd.Flags().String("smtp-server", "", "SMTP server (smtp.gmail.com)")
@@ -3328,6 +4199,9 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	cmd.Flags().Bool("webhook-enabled", false, "Enable webhook notifications")
 	cmd.Flags().String("webhook-url", "", "Webhook endpoint URL")
 	cmd.Flags().StringToString("webhook-headers", map[string]string{}, "Webhook headers (key=value)")
+	cmd.Flags().Bool("slack-enabled", false, "Enable Slack notifications")
+	cmd.Flags().String("slack-webhook-url", "", "Slack webhook URL")
+	cmd.Flags().String("slack-channel", "", "Slack channel (optional, uses webhook default if empty)")
 
 	// viper bindings
 	_ = viper.BindPFlag("config", cmd.Flags().Lookup("config"))
@@ -3343,6 +4217,7 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	_ = viper.BindPFlag("outputs", cmd.Flags().Lookup("outputs"))
 	_ = viper.BindPFlag("output-dir-logs", cmd.Flags().Lookup("output-dir-logs"))
 	_ = viper.BindPFlag("output-dir-filtered", cmd.Flags().Lookup("output-dir-filtered"))
+	_ = viper.BindPFlag("gen-test-agg", cmd.Flags().Lookup("gen-test-agg"))
 	_ = viper.BindPFlag("log-file", cmd.Flags().Lookup("log-file"))
 	_ = viper.BindPFlag("log-level", cmd.Flags().Lookup("log-level"))
 	_ = viper.BindPFlag("log-http", cmd.Flags().Lookup("log-http"))
@@ -3362,13 +4237,26 @@ Go Version: %s`, Version, Stream, BuildDate, GoVersion),
 	_ = viper.BindPFlag("webhook-enabled", cmd.Flags().Lookup("webhook-enabled"))
 	_ = viper.BindPFlag("webhook-url", cmd.Flags().Lookup("webhook-url"))
 	_ = viper.BindPFlag("webhook-headers", cmd.Flags().Lookup("webhook-headers"))
+	_ = viper.BindPFlag("severity-filter", cmd.Flags().Lookup("severity-filter"))
+	_ = viper.BindPFlag("dry-run", cmd.Flags().Lookup("dry-run"))
+	_ = viper.BindPFlag("slack-enabled", cmd.Flags().Lookup("slack-enabled"))
+	_ = viper.BindPFlag("slack-webhook-url", cmd.Flags().Lookup("slack-webhook-url"))
+	_ = viper.BindPFlag("slack-channel", cmd.Flags().Lookup("slack-channel"))
 
 	return cmd
 }
 
 func main() {
+	// Ensure logs are flushed on exit
+	defer func() {
+		// Give logger time to flush
+		time.Sleep(100 * time.Millisecond)
+	}()
+
 	if err := newRootCmd().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error()) // Prints just the message without extra prefix
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		// Try to log the error if logger is available
+		log.Error().Err(err).Msg("application error")
 		os.Exit(1)
 	}
 	os.Exit(0)
