@@ -1,0 +1,65 @@
+FROM golang:1.27.1-alpine AS builder
+
+WORKDIR /src
+RUN apk add --no-cache ca-certificates git
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Version comes from the VERSION file in the build context so a release
+# bump does not require editing this Dockerfile. Stream defaults to Release;
+# override with --build-arg STREAM=beta (and GIT_REVISION / BUILD_DATE).
+ARG STREAM=Release
+ARG GIT_REVISION=unknown
+ARG BUILD_DATE=
+RUN set -eu; \
+    ver="$(tr -d '[:space:]' < VERSION)"; \
+    bd="${BUILD_DATE:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"; \
+    gv="$(go version | awk '{print $3}')"; \
+    flags="-w -s -X main.Version=${ver} -X main.Stream=${STREAM} -X main.GitRevision=${GIT_REVISION} -X main.BuildDate=${bd} -X main.GoVersion=${gv}"; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="${flags}" -o /out/ncc-api-server ./cmd/ncc-api-server; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="${flags}" -o /out/ncc-orchestrator .
+
+FROM alpine:3.24
+
+ARG STREAM=Release
+ARG GIT_REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="ncc-api-server" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      com.ncc-orchestrator.stream="${STREAM}"
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+COPY --from=builder /out/ncc-api-server /usr/local/bin/ncc-api-server
+COPY --from=builder /out/ncc-orchestrator /usr/local/bin/ncc-orchestrator
+
+RUN chmod 0755 /usr/local/bin/ncc-api-server /usr/local/bin/ncc-orchestrator \
+    && mkdir -p /app/data/auth /app/outputfiles /app/nccfiles /app/logs /app/config \
+    && chown -R 10001:10001 /app
+
+USER 10001:10001
+
+EXPOSE 8081
+# HEALTHCHECK uses the api-server's own --health-check mode (added in
+# v2.0.2). Avoids needing wget/curl in the runtime image and reads the
+# token file the api-server itself wrote, so probe and server share
+# the same auth path.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/usr/local/bin/ncc-api-server", "--health-check", "--listen", "127.0.0.1:8081", "--token-file-path", "/app/data/auth/.ncc-api-token"]
+
+# --users-db lives under the persistent /app/data/auth dir so the local
+# account store (and the first-run bootstrap admin) survive container
+# restarts. On first launch the server prints a random admin password to
+# the log (and writes /app/data/auth/.ncc-initial-admin-password) which
+# must be changed on first login. auth-mode auto-upgrades to hybrid so
+# static-token automation keeps working alongside browser logins.
+ENTRYPOINT ["/usr/local/bin/ncc-api-server"]
+CMD ["--listen", ":8081", "--repo-root", "/app", "--config-path", "/app/config/config.yaml", "--output-dir", "/app/outputfiles", "--log-dir", "/app/nccfiles", "--runner-log-path", "/app/logs/ncc-runner.log", "--token-file-path", "/app/data/auth/.ncc-api-token", "--users-db", "/app/data/auth/.ncc-api-users.json", "--orchestrator-bin", "/usr/local/bin/ncc-orchestrator", "--auth-mode", "token", "--cors-origin", "http://localhost:8080"]

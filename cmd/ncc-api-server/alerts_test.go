@@ -1,0 +1,129 @@
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestPCAlertsURL(t *testing.T) {
+	got, err := pcAlertsURL("pc.example.com:9440", "v4.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://pc.example.com:9440/api/monitoring/v4.3/serviceability/alerts" {
+		t.Fatalf("unexpected URL: %s", got)
+	}
+}
+
+func TestPCAlertsURLDefaultsPort(t *testing.T) {
+	got, err := pcAlertsURL("10.21.10.208", "v4.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://10.21.10.208:9440/api/monitoring/v4.2/serviceability/alerts" {
+		t.Fatalf("unexpected URL: %s", got)
+	}
+}
+
+func TestNormalizePCAlert(t *testing.T) {
+	row := normalizePCAlert(map[string]interface{}{
+		"clusterName":    "lab-a",
+		"entityName":     "node-1",
+		"entityType":     "HOST",
+		"title":          "Storage warning",
+		"severity":       "WARNING",
+		"message":        "Capacity is high",
+		"status":         "OPEN",
+		"impactType":     "PERFORMANCE",
+		"creationTime":   "2026-09-01T10:00:00Z",
+		"isAcknowledged": false,
+	})
+	if row["source"] != "PC" || row["severity"] != "WARN" || row["cluster"] != "lab-a" ||
+		row["entity_name"] != "node-1" || row["entity_type"] != "HOST" || row["impact_type"] != "PERFORMANCE" {
+		t.Fatalf("unexpected normalized row: %#v", row)
+	}
+}
+
+func TestNormalizePCAlertKeepsKBAndRootCause(t *testing.T) {
+	row := normalizePCAlert(map[string]interface{}{
+		"title":             "Disk almost full",
+		"message":           "Capacity is high",
+		"rootCauseAnalysis": "CVM disk /home is 92% full",
+		"severity":          "CRITICAL",
+		"extId":             "abc-123",
+		"serviceName":       "Stargate",
+		"kbArticles": []interface{}{
+			"https://portal.nutanix.com/kb/1234",
+			map[string]interface{}{"url": "https://portal.nutanix.com/kb/5678"},
+		},
+	})
+	if row["detail"] != "Capacity is high" || row["root_cause"] != "CVM disk /home is 92% full" {
+		t.Fatalf("message/root cause: %#v", row)
+	}
+	if row["ext_id"] != "abc-123" || row["service_name"] != "Stargate" {
+		t.Fatalf("ids: %#v", row)
+	}
+	kbs, _ := row["kb_articles"].([]string)
+	if len(kbs) != 2 || kbs[0] != "https://portal.nutanix.com/kb/1234" || kbs[1] != "https://portal.nutanix.com/kb/5678" {
+		t.Fatalf("kb_articles: %#v", row["kb_articles"])
+	}
+}
+
+func TestNormalizePCAlertKeepsUUID(t *testing.T) {
+	row := normalizePCAlert(map[string]interface{}{
+		"clusterUUID": "aaaa-bbbb",
+		"title":       "Disk",
+		"severity":    "CRITICAL",
+	})
+	if row["cluster"] != "aaaa-bbbb" || row["cluster_uuid"] != "aaaa-bbbb" {
+		t.Fatalf("expected UUID preserved, got %#v", row)
+	}
+	idx := map[string]pcCluster{
+		normClusterName("aaaa-bbbb"): {Name: "prod-1", Address: "10.1.2.3", ExtID: "aaaa-bbbb"},
+	}
+	resolved := resolvePCAlertCluster(row, idx)
+	if resolved["cluster"] != "prod-1" || resolved["cluster_name"] != "prod-1" || resolved["cluster_ip"] != "10.1.2.3" {
+		t.Fatalf("expected UUID resolved to name/IP, got %#v", resolved)
+	}
+}
+
+func TestFetchPCAlertsPagination(t *testing.T) {
+	var requests int
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("$limit") != "100" ||
+			r.URL.Query().Get("$orderby") != "lastUpdatedTime desc" ||
+			r.URL.Query().Get("$filter") != "isResolved eq false" {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("$page") == "0" {
+			w.Write([]byte(`{"metadata":{"totalAvailableResults":2},"data":[{"clusterName":"lab-a","title":"a","severity":"CRITICAL"}]}`))
+			return
+		}
+		w.Write([]byte(`{"metadata":{"totalAvailableResults":2},"data":[{"clusterName":"lab-b","title":"b","severity":"INFO"}]}`))
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	rows, err := fetchPCAlerts(client, server.URL, "v4.2", "admin", "secret", "No")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0]["severity"] != "FAIL" || rows[1]["severity"] != "INFO" || requests != 2 {
+		t.Fatalf("unexpected rows/requests: %#v/%d", rows, requests)
+	}
+}
+
+func TestPCAlertTargets(t *testing.T) {
+	got := pcAlertTargets(map[string]interface{}{"pcs": "pc-a, pc-b"})
+	if strings.Join(got, ",") != "pc-a,pc-b" {
+		t.Fatalf("unexpected targets: %#v", got)
+	}
+	if d := rawDuration(map[string]interface{}{"request-timeout": "2s"}, "request-timeout", time.Second); d != 2*time.Second {
+		t.Fatalf("unexpected duration: %s", d)
+	}
+}

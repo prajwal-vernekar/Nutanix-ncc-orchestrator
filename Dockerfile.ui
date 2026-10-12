@@ -1,0 +1,64 @@
+FROM node:26-alpine AS frontend-builder
+
+WORKDIR /frontend
+# Node 22.8+ code cache, kept by 24 and 26. tsc and Vite share compiled modules in this stage.
+ENV NODE_COMPILE_CACHE=/tmp/node-compile-cache
+
+COPY frontend/package*.json ./
+RUN npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
+FROM golang:1.27.1-alpine AS go-builder
+
+WORKDIR /src
+RUN apk add --no-cache ca-certificates git
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Same link flags as ncc-orchestrator / ncc-api-server (including Stream).
+# Version is read from VERSION so image builds follow the release file.
+ARG STREAM=Release
+ARG GIT_REVISION=unknown
+ARG BUILD_DATE=
+RUN set -eu; \
+    ver="$(tr -d '[:space:]' < VERSION)"; \
+    bd="${BUILD_DATE:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"; \
+    gv="$(go version | awk '{print $3}')"; \
+    flags="-w -s -X main.Version=${ver} -X main.Stream=${STREAM} -X main.GitRevision=${GIT_REVISION} -X main.BuildDate=${bd} -X main.GoVersion=${gv}"; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="${flags}" -o /out/ncc-ui-server ./cmd/ncc-ui-server
+
+FROM alpine:3.24
+
+ARG STREAM=Release
+ARG GIT_REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="ncc-ui-server" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      com.ncc-orchestrator.stream="${STREAM}"
+
+RUN apk add --no-cache ca-certificates tzdata wget
+
+WORKDIR /app
+
+COPY --from=go-builder /out/ncc-ui-server /usr/local/bin/ncc-ui-server
+COPY --from=frontend-builder /frontend/dist /app/frontend/dist
+
+RUN chmod 0755 /usr/local/bin/ncc-ui-server \
+    && mkdir -p /app/data/auth \
+    && chown -R 10001:10001 /app
+
+USER 10001:10001
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/ncc-ui-server"]
+CMD ["--listen", ":8080", "--dir", "/app/frontend/dist", "--backend-url", "http://ncc-api-server:8081", "--api-token-file", "/app/data/auth/.ncc-api-token", "--api-auth-mode", "token", "--allowed-origins", "http://localhost:8080"]

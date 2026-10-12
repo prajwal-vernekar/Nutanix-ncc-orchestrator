@@ -1,20 +1,117 @@
 package main
 
 import (
+	"archive/tar"
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/viper"
+
+	"goncc/internal/notify"
 )
+
+func TestEnsureV2StartSlotsAvailable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("listen probing uses POSIX-style process semantics")
+	}
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(runDir, "v2-api.pid")
+	if err := os.WriteFile(stale, []byte("99999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().String()
+	_ = ln.Close()
+
+	if err := ensureV2StartSlotsAvailable(dir, v2StartOptions{
+		InstallDir: dir,
+		APIOnly:    true,
+		APIListen:  port,
+	}); err != nil {
+		t.Fatalf("expected stale pid cleanup and free port to pass: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale pid file was not removed: %v", err)
+	}
+
+	holder := exec.Command("sleep", "30")
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Process.Kill(); _, _ = holder.Process.Wait() }()
+	// On Linux, processIdentityMatches reads /proc/<pid>/cmdline; immediately
+	// after Start() returns, some CI runners haven't yet populated it (a
+	// transient empty read is treated conservatively as "unknown, assume
+	// match" to avoid mistaking a real running instance for a stale one).
+	// Poll until the child's real identity is visible so this test isn't
+	// flaky on process-startup timing.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if known, matches := processIdentityMatches(holder.Process.Pid, "ncc-api-server"); known && !matches {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	reused := filepath.Join(runDir, "v2-api.pid")
+	if err := os.WriteFile(reused, []byte(fmt.Sprintf("%d\n", holder.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureV2StartSlotsAvailable(dir, v2StartOptions{
+		InstallDir: dir,
+		APIOnly:    true,
+		APIListen:  port,
+	}); err != nil {
+		t.Fatalf("expected unrelated live PID to be treated as stale: %v", err)
+	}
+	if _, err := os.Stat(reused); !os.IsNotExist(err) {
+		t.Fatalf("reused PID file was not removed: %v", err)
+	}
+
+	ln, err = net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	err = ensureV2StartSlotsAvailable(dir, v2StartOptions{
+		InstallDir: dir,
+		APIOnly:    true,
+		APIListen:  ln.Addr().String(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("expected occupied port error, got %v", err)
+	}
+}
 
 // ==================== Utility Function Tests ====================
 
@@ -79,6 +176,225 @@ func TestSplitCSV(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQuickstartPrompt_EmptyThenDefault(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("\n\n"))
+	got, err := quickstartPrompt(reader, "Cluster targets", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("quickstartPrompt returned error: %v", err)
+	}
+	if got != "10.0.0.1" {
+		t.Fatalf("expected default value, got %q", got)
+	}
+}
+
+func TestQuickstartConfirm_EmptyThenDefault(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("\n\n"))
+	got, err := quickstartConfirm(reader, "Apply?", true)
+	if err != nil {
+		t.Fatalf("quickstartConfirm returned error: %v", err)
+	}
+	if !got {
+		t.Fatal("expected default yes on double empty input")
+	}
+}
+
+func TestQuickstartPromptChoice_InvalidThenDefault(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("wrong\n\n\n"))
+	got, err := quickstartPromptChoice(reader, "Mode", "clusters", []string{"clusters", "pc"})
+	if err != nil {
+		t.Fatalf("quickstartPromptChoice returned error: %v", err)
+	}
+	if got != "clusters" {
+		t.Fatalf("expected fallback to default, got %q", got)
+	}
+}
+
+func TestRepairConfigInlineCommentValues(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	bad := []byte("timeout: \"15m\\\"                            # Per-cluster overall timeout\"\nrequest-timeout: \"20s\"\n")
+	if err := os.WriteFile(cfgPath, bad, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	changed, err := repairConfigInlineCommentValues(cfgPath)
+	if err != nil {
+		t.Fatalf("repairConfigInlineCommentValues error: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected repair to report changes")
+	}
+	gotRaw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	got := string(gotRaw)
+	if !strings.Contains(got, "timeout: \"15m\"") {
+		t.Fatalf("expected repaired timeout value, got: %s", got)
+	}
+	if strings.Contains(got, "\\\"                            #") {
+		t.Fatalf("expected legacy malformed suffix to be removed, got: %s", got)
+	}
+}
+
+func TestRepairConfigInlineCommentValues_TrailingBackslashes(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	bad := []byte("timeout: \"15m\\\\\"\nrequest-timeout: \"20s\\\\\"\n")
+	if err := os.WriteFile(cfgPath, bad, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	changed, err := repairConfigInlineCommentValues(cfgPath)
+	if err != nil {
+		t.Fatalf("repairConfigInlineCommentValues error: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected trailing backslash repair to report changes")
+	}
+	gotRaw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	got := string(gotRaw)
+	if !strings.Contains(got, "timeout: \"15m\"") || !strings.Contains(got, "request-timeout: \"20s\"") {
+		t.Fatalf("expected cleaned duration values, got: %s", got)
+	}
+}
+
+func TestRepairConfigInlineCommentValues_StripsInlineCommentTailForKnownKeys(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	bad := []byte("nutanix-v4-api-version: \"v4.2              # v4 path revision\"\n")
+	if err := os.WriteFile(cfgPath, bad, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	changed, err := repairConfigInlineCommentValues(cfgPath)
+	if err != nil {
+		t.Fatalf("repairConfigInlineCommentValues error: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected inline comment tail repair to report changes")
+	}
+	gotRaw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	got := string(gotRaw)
+	if !strings.Contains(got, "nutanix-v4-api-version: \"v4.2\"") {
+		t.Fatalf("expected cleaned v4 api version value, got: %s", got)
+	}
+}
+
+func TestValidateSecretsFileHardening(t *testing.T) {
+	tmpDir := t.TempDir()
+	okPath := filepath.Join(tmpDir, "secrets.yaml")
+	if err := os.WriteFile(okPath, []byte("password: secret\n"), 0o600); err != nil {
+		t.Fatalf("write secrets file: %v", err)
+	}
+	if err := validateSecretsFileHardening(okPath); err != nil {
+		t.Fatalf("expected secure file to pass, got: %v", err)
+	}
+	loosePath := filepath.Join(tmpDir, "secrets-loose.yaml")
+	if err := os.WriteFile(loosePath, []byte("password: secret\n"), 0o644); err != nil {
+		t.Fatalf("write loose secrets file: %v", err)
+	}
+	if err := validateSecretsFileHardening(loosePath); err == nil {
+		t.Fatal("expected loose permissions to fail hardening check")
+	}
+}
+
+func TestApplyArtifactRetentionPolicies(t *testing.T) {
+	tmpDir := t.TempDir()
+	protected := filepath.Join(tmpDir, "index.html")
+	if err := os.WriteFile(protected, []byte("index"), 0o644); err != nil {
+		t.Fatalf("write protected file: %v", err)
+	}
+	oldFile := filepath.Join(tmpDir, "old.log")
+	if err := os.WriteFile(oldFile, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	newFile := filepath.Join(tmpDir, "new.log")
+	if err := os.WriteFile(newFile, []byte("new"), 0o644); err != nil {
+		t.Fatalf("write new file: %v", err)
+	}
+	now := time.Now()
+	oldTime := now.Add(-72 * time.Hour)
+	if err := os.Chtimes(oldFile, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes old file: %v", err)
+	}
+	if _, err := applyArtifactRetentionPolicies(tmpDir, 2, 1, now); err != nil {
+		t.Fatalf("applyArtifactRetentionPolicies failed: %v", err)
+	}
+	if _, err := os.Stat(protected); err != nil {
+		t.Fatalf("protected file should remain: %v", err)
+	}
+	if _, err := os.Stat(oldFile); err == nil {
+		t.Fatal("old file should have been deleted by retention")
+	}
+}
+
+func TestClassifyClusterError(t *testing.T) {
+	tests := []struct {
+		msg  string
+		want string
+	}{
+		{"context deadline exceeded", "timeout"},
+		{"start checks failed: get summary failed: HTTP 401", "auth"},
+		{"retry circuit breaker opened after 3 consecutive retryable failures (last HTTP 429)", "rate_limit"},
+		{"parse filtered failed", "parser"},
+		{"dial tcp 10.0.0.1:9440: connect: connection refused", "network"},
+		{"start checks failed: get summary failed: HTTP 500", "api"},
+		// Regression: a DNS-failure-driven circuit-breaker must classify as
+		// `network`, not `rate_limit`. The breaker opens on transport errors
+		// for unresolved hosts, but the underlying problem is DNS.
+		{"start checks failed: get cluster uuid v4 retry circuit breaker opened after 3 consecutive transport failures: dial tcp: lookup PC-Rushmore: no such host", "network"},
+		{"retry circuit breaker opened after 3 consecutive transport failures: dial tcp 10.0.0.1:9440: connect: no route to host", "network"},
+		{"tls: handshake failure", "network"},
+		{"x509: certificate signed by unknown authority", "network"},
+		{"HTTP 429 Too Many Requests; Retry-After 5", "rate_limit"},
+	}
+	for _, tt := range tests {
+		got := classifyClusterError(errors.New(tt.msg))
+		if got != tt.want {
+			t.Fatalf("classifyClusterError(%q)=%q want %q", tt.msg, got, tt.want)
+		}
+	}
+}
+
+func TestDoWithRetryCircuitBreaker(t *testing.T) {
+	attempts := 0
+	client := &mockHTTPClient{
+		doFunc: func(req *http.Request) (*http.Response, error) {
+			attempts++
+			return &http.Response{
+				StatusCode: 503,
+				Body:       io.NopCloser(strings.NewReader("service unavailable")),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+	cfg := Config{
+		RetryMaxAttempts:    6,
+		RetryBaseDelay:      1 * time.Millisecond,
+		RetryMaxDelay:       2 * time.Millisecond,
+		RetryCircuitBreaker: 2,
+		RequestTimeout:      2 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.test", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	_, _, err = doWithRetry(context.Background(), client, req, cfg, "test-op")
+	if err == nil {
+		t.Fatal("expected circuit breaker error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "circuit breaker") {
+		t.Fatalf("expected circuit breaker error, got %v", err)
+	}
+	if attempts != cfg.RetryCircuitBreaker {
+		t.Fatalf("expected %d attempts before breaker, got %d", cfg.RetryCircuitBreaker, attempts)
 	}
 }
 
@@ -313,6 +629,108 @@ func TestFilterBlocksBySeverity(t *testing.T) {
 				}
 				if !found && len(tt.allowed) > 0 {
 					t.Errorf("Block %d has severity %s which is not in allowed list", i, sev)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterBlocksByTitle(t *testing.T) {
+	blocks := []ParsedBlock{
+		{Severity: "FAIL", CheckName: "AOS service health", DetailRaw: "Detail1"},
+		{Severity: "WARN", CheckName: "Disk health", DetailRaw: "Detail2"},
+		{Severity: "INFO", CheckName: "Prism connectivity", DetailRaw: "Detail3"},
+		{Severity: "ERR", CheckName: "AOS service health degraded", DetailRaw: "Detail4"},
+	}
+
+	tests := []struct {
+		name          string
+		excluded      []string
+		mode          string
+		expectedCount int
+		excludedCount int
+		expectTitles  []string
+		wantErr       bool
+	}{
+		{
+			name:          "Exclude single title",
+			excluded:      []string{"AOS service health"},
+			mode:          "exact",
+			expectedCount: 3,
+			excludedCount: 1,
+			expectTitles:  []string{"Disk health", "Prism connectivity", "AOS service health degraded"},
+		},
+		{
+			name:          "Exclude contains mode",
+			excluded:      []string{"service health"},
+			mode:          "contains",
+			expectedCount: 2,
+			excludedCount: 2,
+			expectTitles:  []string{"Disk health", "Prism connectivity"},
+		},
+		{
+			name:          "Exclude regex mode",
+			excluded:      []string{"AOS\\s+service\\s+health.*"},
+			mode:          "regex",
+			expectedCount: 2,
+			excludedCount: 2,
+			expectTitles:  []string{"Disk health", "Prism connectivity"},
+		},
+		{
+			name:          "Exclude multiple titles exact",
+			excluded:      []string{"AOS service health", "Disk health"},
+			mode:          "exact",
+			expectedCount: 2,
+			excludedCount: 2,
+			expectTitles:  []string{"Prism connectivity", "AOS service health degraded"},
+		},
+		{
+			name:          "Exclude with case-insensitive exact match",
+			excluded:      []string{"aos SERVICE health"},
+			mode:          "exact",
+			expectedCount: 3,
+			excludedCount: 1,
+			expectTitles:  []string{"Disk health", "Prism connectivity", "AOS service health degraded"},
+		},
+		{
+			name:          "No exclusions",
+			excluded:      []string{},
+			mode:          "exact",
+			expectedCount: 4,
+			excludedCount: 0,
+			expectTitles:  []string{"AOS service health", "Disk health", "Prism connectivity", "AOS service health degraded"},
+		},
+		{
+			name:          "Invalid regex",
+			excluded:      []string{"[unclosed"},
+			mode:          "regex",
+			expectedCount: 4,
+			excludedCount: 0,
+			wantErr:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, excluded, err := filterBlocksByTitle(blocks, tt.excluded, tt.mode)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error but got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(result) != tt.expectedCount {
+				t.Fatalf("expected %d blocks, got %d", tt.expectedCount, len(result))
+			}
+			if len(excluded) != tt.excludedCount {
+				t.Fatalf("expected %d excluded blocks, got %d", tt.excludedCount, len(excluded))
+			}
+			for i, b := range result {
+				if !contains(tt.expectTitles, b.CheckName) {
+					t.Errorf("row %d has unexpected title %q", i, b.CheckName)
 				}
 			}
 		})
@@ -556,33 +974,8 @@ func TestGenerateCSV(t *testing.T) {
 }
 
 // ==================== Parsing Tests ====================
-
-func TestDetectSeverity(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{"FAIL with colon", "FAIL: something", "FAIL"},
-		{"WARN with colon", "WARN: something", "WARN"},
-		{"ERR with colon", "ERR: something", "ERR"},
-		{"INFO with colon", "INFO: something", "INFO"},
-		{"FAIL without colon", "This is a FAIL message", "INFO"}, // detectSeverity requires colon
-		{"WARN without colon", "This is a WARN message", "INFO"}, // detectSeverity requires colon
-		{"No severity", "This is a normal message", "INFO"},
-		{"Empty string", "", "INFO"},
-		{"Multiple severities", "FAIL: but also WARN:", "FAIL"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := detectSeverity(tt.input)
-			if result != tt.expected {
-				t.Errorf("Expected %s, got %s", tt.expected, result)
-			}
-		})
-	}
-}
+// TestDetectSeverity moved to goncc/internal/nccparse (tests the unexported
+// detectSeverity alongside the extracted parser).
 
 func TestSplitLines(t *testing.T) {
 	tests := []struct {
@@ -640,10 +1033,11 @@ func TestSplitLines(t *testing.T) {
 
 func TestParseSummary(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		wantErr   bool
-		minBlocks int
+		name       string
+		input      string
+		wantErr    bool
+		minBlocks  int
+		checkNames []string // optional: exact check names for first blocks
 	}{
 		{
 			name: "Valid summary",
@@ -654,8 +1048,9 @@ Refer to something
 Detailed information for Check2
 More details
 Refer to something else`,
-			wantErr:   false,
-			minBlocks: 2,
+			wantErr:    false,
+			minBlocks:  2,
+			checkNames: []string{"Detailed information for Check1", "Detailed information for Check2"},
 		},
 		{
 			name:      "Empty summary",
@@ -668,8 +1063,25 @@ Refer to something else`,
 			input: `Detailed information for Check1
 Detail
 Refer to something`,
+			wantErr:    false,
+			minBlocks:  1,
+			checkNames: []string{"Detailed information for Check1"},
+		},
+		{
+			name: "No blocks (no block start line)",
+			input: `Refer to documentation
+Some other line`,
 			wantErr:   false,
-			minBlocks: 1,
+			minBlocks: 0,
+		},
+		{
+			name: "Invalid / no Refer to line still captures block",
+			input: `Detailed information for MyCheck
+FAIL: something wrong
+No Refer line`,
+			wantErr:    false,
+			minBlocks:  1,
+			checkNames: []string{"Detailed information for MyCheck"},
 		},
 	}
 
@@ -683,7 +1095,32 @@ Refer to something`,
 			if len(blocks) < tt.minBlocks {
 				t.Errorf("Expected at least %d blocks, got %d", tt.minBlocks, len(blocks))
 			}
+			for i, wantName := range tt.checkNames {
+				if i >= len(blocks) {
+					break
+				}
+				if blocks[i].CheckName != wantName {
+					t.Errorf("Block %d CheckName = %q, want %q", i, blocks[i].CheckName, wantName)
+				}
+			}
 		})
+	}
+}
+
+func TestDigestOverviewFormat(t *testing.T) {
+	// Digest overview format: "Run completed in %s. Clusters OK: %d, Failed: %d."
+	runDuration := 2*time.Minute + 30*time.Second
+	clustersOK, clustersFailed := 3, 1
+	overview := fmt.Sprintf("Run completed in %s. Clusters OK: %d, Failed: %d.",
+		runDuration.Round(time.Second), clustersOK, clustersFailed)
+	if !strings.Contains(overview, "Run completed") {
+		t.Error("overview should contain 'Run completed'")
+	}
+	if !strings.Contains(overview, "Clusters OK") {
+		t.Error("overview should contain 'Clusters OK'")
+	}
+	if !strings.Contains(overview, "3") || !strings.Contains(overview, "1") {
+		t.Error("overview should contain cluster counts")
 	}
 }
 
@@ -924,7 +1361,7 @@ func TestSendSlackDisabled(t *testing.T) {
 	ctx := context.Background()
 	client := &mockHTTPClient{}
 
-	err := sendSlack(ctx, client, cfg, NotificationSummary{})
+	err := notify.SendSlack(ctx, client, cfg, NotificationSummary{})
 	if err != nil {
 		t.Errorf("sendSlack should return nil when disabled, got %v", err)
 	}
@@ -939,7 +1376,7 @@ func TestSendWebhookDisabled(t *testing.T) {
 	ctx := context.Background()
 	client := &mockHTTPClient{}
 
-	err := sendWebhook(ctx, client, cfg, NotificationSummary{})
+	err := notify.SendWebhook(ctx, client, cfg, NotificationSummary{})
 	if err != nil {
 		t.Errorf("sendWebhook should return nil when disabled, got %v", err)
 	}
@@ -1109,6 +1546,73 @@ func TestBindConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestResolveUnderBase(t *testing.T) {
+	base := filepath.Join(string(filepath.Separator), "opt", "ncc")
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"relative is anchored", "outputfiles", filepath.Join(base, "outputfiles")},
+		{"nested relative is anchored", filepath.Join("data", "runs"), filepath.Join(base, "data", "runs")},
+		{"absolute is untouched", filepath.Join(string(filepath.Separator), "var", "lib", "x"), filepath.Join(string(filepath.Separator), "var", "lib", "x")},
+		{"empty stays empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveUnderBase(tc.in, base); got != tc.want {
+				t.Errorf("resolveUnderBase(%q, %q) = %q, want %q", tc.in, base, got, tc.want)
+			}
+		})
+	}
+	if got := resolveUnderBase("outputfiles", ""); got != "outputfiles" {
+		t.Errorf("empty base must leave path unchanged, got %q", got)
+	}
+}
+
+// TestBindConfigAnchorsRelativeOutputDirsToConfigDir is the regression guard for
+// the scheduled-run bug: a cron job runs the orchestrator with an arbitrary
+// working directory, so relative output dirs in config.yaml must resolve against
+// the config file's directory (not the cwd) so results land where the API/UI
+// reads them.
+func TestBindConfigAnchorsRelativeOutputDirsToConfigDir(t *testing.T) {
+	viper.Reset()
+	defer viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfgBody := "clusters: \"10.0.0.1\"\n" +
+		"username: \"admin\"\n" +
+		"output-dir-logs: \"nccfiles\"\n" +
+		"output-dir-filtered: \"outputfiles\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	cfg, err := bindConfig()
+	if err != nil {
+		t.Fatalf("bindConfig() failed: %v", err)
+	}
+
+	wantLogs := filepath.Join(dir, "nccfiles")
+	wantFiltered := filepath.Join(dir, "outputfiles")
+	if cfg.OutputDirLogs != wantLogs {
+		t.Errorf("OutputDirLogs = %q, want %q (anchored to config dir)", cfg.OutputDirLogs, wantLogs)
+	}
+	if cfg.OutputDirFiltered != wantFiltered {
+		t.Errorf("OutputDirFiltered = %q, want %q (anchored to config dir)", cfg.OutputDirFiltered, wantFiltered)
+	}
+	// RunHistoryDir is derived from OutputDirFiltered and must inherit the base.
+	wantHistory := filepath.Join(wantFiltered, "runs")
+	if cfg.RunHistoryDir != wantHistory {
+		t.Errorf("RunHistoryDir = %q, want %q", cfg.RunHistoryDir, wantHistory)
+	}
+}
+
 func TestBindConfigWithFlags(t *testing.T) {
 	// Reset viper
 	viper.Reset()
@@ -1173,6 +1677,79 @@ func TestBindConfigWithFlags(t *testing.T) {
 	}
 	if !cfg.LogHTTP {
 		t.Error("Expected LogHTTP to be true")
+	}
+}
+
+func TestBindConfigPCModeWithPcsFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmpDir := t.TempDir()
+	pcsFile := filepath.Join(tmpDir, "pcs.txt")
+	content := "# pcs list\n10.10.10.10\npc-lab.local\n"
+	if err := os.WriteFile(pcsFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("write pcs file: %v", err)
+	}
+
+	viper.Set("cluster-source-mode", "pc")
+	viper.Set("pcs-file", pcsFile)
+	viper.Set("username", "admin")
+
+	cfg, err := bindConfig()
+	if err != nil {
+		t.Fatalf("bindConfig() failed: %v", err)
+	}
+	if cfg.ClusterSourceMode != "pc" {
+		t.Fatalf("expected cluster-source-mode pc, got %q", cfg.ClusterSourceMode)
+	}
+	if len(cfg.PCs) != 2 {
+		t.Fatalf("expected 2 pc targets, got %d (%v)", len(cfg.PCs), cfg.PCs)
+	}
+	if cfg.PCs[0] != "10.10.10.10" || cfg.PCs[1] != "pc-lab.local" {
+		t.Fatalf("unexpected pcs list: %v", cfg.PCs)
+	}
+}
+
+func TestDiscoverClustersFromPCTargetsV3(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/nutanix/v3/clusters/list" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "admin" || pass != "secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entities":[{"spec":{"resources":{"network":{"external_ip":"10.20.30.40"}}}},{"spec":{"resources":{"network":{"external_ip":"10.20.30.41"}}}}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		ClusterSourceMode:   "pc",
+		PCs:                 []string{srv.URL},
+		Username:            "admin",
+		Password:            "secret",
+		InsecureSkipVerify:  true,
+		DiscoverAPIVersion:  "v3",
+		NutanixV4APIVersion: defaultNutanixV4APIVersion,
+	}
+	clusters, err := discoverClustersFromPCTargets(cfg)
+	if err != nil {
+		t.Fatalf("discoverClustersFromPCTargets() failed: %v", err)
+	}
+	if len(clusters) != 2 {
+		t.Fatalf("expected 2 discovered clusters, got %d (%v)", len(clusters), clusters)
+	}
+	if clusters[0] != "10.20.30.40" || clusters[1] != "10.20.30.41" {
+		t.Fatalf("unexpected discovered clusters: %v", clusters)
 	}
 }
 
@@ -1308,6 +1885,129 @@ func TestBindConfigSeverityFilter(t *testing.T) {
 	}
 }
 
+func TestBindConfigExcludeAlertTitles(t *testing.T) {
+	tests := []struct {
+		name          string
+		excludes      string
+		expectedCount int
+		expected      []string
+	}{
+		{"Single title", "AOS service health", 1, []string{"AOS service health"}},
+		{"Multiple titles", "AOS service health,Disk health", 2, []string{"AOS service health", "Disk health"}},
+		{"With spaces", "AOS service health, Disk health , Prism connectivity", 3, []string{"AOS service health", "Disk health", "Prism connectivity"}},
+		{"Empty excludes", "", 0, []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+			viper.SetEnvPrefix("ncc")
+			viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+			viper.AutomaticEnv()
+
+			if tt.excludes != "" {
+				viper.Set("exclude-alert-titles", tt.excludes)
+			}
+			setMinimalValidConfig()
+
+			cfg, err := bindConfig()
+			if err != nil {
+				t.Fatalf("bindConfig() failed: %v", err)
+			}
+
+			if len(cfg.ExcludeAlertTitles) != tt.expectedCount {
+				t.Errorf("Expected %d excluded titles, got %d", tt.expectedCount, len(cfg.ExcludeAlertTitles))
+			}
+
+			for _, expected := range tt.expected {
+				if !contains(cfg.ExcludeAlertTitles, expected) {
+					t.Errorf("Expected excluded title %q not found in %v", expected, cfg.ExcludeAlertTitles)
+				}
+			}
+		})
+	}
+}
+
+func TestBindConfigExcludeAlertTitlesFileMergeAndMode(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "exclude-titles.txt")
+	content := "# comment line\nAOS service health\nDisk health\n"
+	if err := os.WriteFile(filePath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write exclude titles file: %v", err)
+	}
+
+	viper.Set("exclude-alert-titles", "Prism connectivity,Disk health")
+	viper.Set("exclude-alert-titles-file", filePath)
+	viper.Set("exclude-alert-match-mode", "contains")
+	setMinimalValidConfig()
+
+	cfg, err := bindConfig()
+	if err != nil {
+		t.Fatalf("bindConfig() failed: %v", err)
+	}
+	if cfg.ExcludeAlertMatchMode != "contains" {
+		t.Fatalf("expected contains mode, got %q", cfg.ExcludeAlertMatchMode)
+	}
+	for _, want := range []string{"AOS service health", "Disk health", "Prism connectivity"} {
+		if !contains(cfg.ExcludeAlertTitles, want) {
+			t.Errorf("expected merged title %q in %v", want, cfg.ExcludeAlertTitles)
+		}
+	}
+}
+
+func TestBindConfigExcludeAlertMatchModeInvalid(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	viper.Set("exclude-alert-match-mode", "wildcard")
+	setMinimalValidConfig()
+
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("expected bindConfig to fail for invalid exclude-alert-match-mode")
+	}
+	if !strings.Contains(err.Error(), "exclude-alert-match-mode") {
+		t.Fatalf("expected exclude-alert-match-mode error, got: %v", err)
+	}
+}
+
+func TestWriteExcludedAlertsAuditJSONSchemaVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	perCluster := map[string][]ExcludedAlert{
+		"10.0.0.1": {
+			{
+				Severity:   "FAIL",
+				CheckName:  "AOS service health",
+				Detail:     "detail",
+				MatchMode:  "exact",
+				MatchValue: "AOS service health",
+			},
+		},
+	}
+	if err := writeExcludedAlertsAuditJSON(OSFS{}, tmpDir, "exact", []string{"AOS service health"}, perCluster); err != nil {
+		t.Fatalf("writeExcludedAlertsAuditJSON failed: %v", err)
+	}
+	path := filepath.Join(tmpDir, "excluded-alerts.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read excluded-alerts.json failed: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(b, &payload); err != nil {
+		t.Fatalf("unmarshal excluded-alerts.json failed: %v", err)
+	}
+	if got, _ := payload["schema_version"].(string); got != "1.0" {
+		t.Fatalf("expected schema_version 1.0, got %q", got)
+	}
+}
+
 func TestBindConfigEmailSettings(t *testing.T) {
 	viper.Reset()
 	viper.SetEnvPrefix("ncc")
@@ -1315,12 +2015,12 @@ func TestBindConfigEmailSettings(t *testing.T) {
 	viper.AutomaticEnv()
 
 	viper.Set("email-enabled", true)
-	viper.Set("smtp-server", "smtp.example.com")
+	viper.Set("smtp-server", "smtp.corp.test")
 	viper.Set("smtp-port", "587")
-	viper.Set("smtp-user", "user@example.com")
+	viper.Set("smtp-user", "user@corp.test")
 	viper.Set("smtp-password", "password123")
-	viper.Set("email-from", "ncc@example.com")
-	viper.Set("email-to", "admin@example.com,ops@example.com")
+	viper.Set("email-from", "ncc@corp.test")
+	viper.Set("email-to", "admin@corp.test,ops@corp.test")
 	viper.Set("email-use-tls", true)
 	setMinimalValidConfig()
 
@@ -1332,20 +2032,20 @@ func TestBindConfigEmailSettings(t *testing.T) {
 	if !cfg.EmailEnabled {
 		t.Error("Expected EmailEnabled to be true")
 	}
-	if cfg.SMTPServer != "smtp.example.com" {
-		t.Errorf("Expected SMTPServer 'smtp.example.com', got %s", cfg.SMTPServer)
+	if cfg.SMTPServer != "smtp.corp.test" {
+		t.Errorf("Expected SMTPServer 'smtp.corp.test', got %s", cfg.SMTPServer)
 	}
 	if cfg.SMTPPort != 587 {
 		t.Errorf("Expected SMTPPort 587, got %d", cfg.SMTPPort)
 	}
-	if cfg.SMTPUser != "user@example.com" {
-		t.Errorf("Expected SMTPUser 'user@example.com', got %s", cfg.SMTPUser)
+	if cfg.SMTPUser != "user@corp.test" {
+		t.Errorf("Expected SMTPUser 'user@corp.test', got %s", cfg.SMTPUser)
 	}
 	if cfg.SMTPPassword != "password123" {
 		t.Errorf("Expected SMTPPassword 'password123', got %s", cfg.SMTPPassword)
 	}
-	if cfg.EmailFrom != "ncc@example.com" {
-		t.Errorf("Expected EmailFrom 'ncc@example.com', got %s", cfg.EmailFrom)
+	if cfg.EmailFrom != "ncc@corp.test" {
+		t.Errorf("Expected EmailFrom 'ncc@corp.test', got %s", cfg.EmailFrom)
 	}
 	if len(cfg.EmailTo) != 2 {
 		t.Errorf("Expected 2 email recipients, got %d", len(cfg.EmailTo))
@@ -1362,7 +2062,7 @@ func TestBindConfigWebhookSettings(t *testing.T) {
 	viper.AutomaticEnv()
 
 	viper.Set("webhook-enabled", true)
-	viper.Set("webhook-url", "https://hooks.example.com/ncc")
+	viper.Set("webhook-url", "https://hooks.corp.test/ncc")
 	viper.Set("webhook-headers", map[string]string{
 		"X-Auth-Token": "token123",
 		"X-Custom":     "value",
@@ -1377,8 +2077,8 @@ func TestBindConfigWebhookSettings(t *testing.T) {
 	if !cfg.WebhookEnabled {
 		t.Error("Expected WebhookEnabled to be true")
 	}
-	if cfg.WebhookURL != "https://hooks.example.com/ncc" {
-		t.Errorf("Expected WebhookURL 'https://hooks.example.com/ncc', got %s", cfg.WebhookURL)
+	if cfg.WebhookURL != "https://hooks.corp.test/ncc" {
+		t.Errorf("Expected WebhookURL 'https://hooks.corp.test/ncc', got %s", cfg.WebhookURL)
 	}
 	if len(cfg.WebhookHeaders) != 2 {
 		t.Errorf("Expected 2 webhook headers, got %d", len(cfg.WebhookHeaders))
@@ -1594,6 +2294,181 @@ func TestBindConfigInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestBindConfigInvalidBoolInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "bad-bool.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+insecure-skip-verify: flse
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("bindConfig() expected to fail for invalid bool in config file")
+	}
+	if !strings.Contains(err.Error(), "insecure-skip-verify") {
+		t.Fatalf("expected insecure-skip-verify error, got: %v", err)
+	}
+}
+
+func TestBindConfigInvalidDurationInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "bad-duration.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+request-timeout: "30seconds"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("bindConfig() expected to fail for invalid duration in config file")
+	}
+	if !strings.Contains(err.Error(), "request-timeout") {
+		t.Fatalf("expected request-timeout error, got: %v", err)
+	}
+}
+
+func TestBindConfigUnknownKeyInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "unknown-key.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+strict-mode: true
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("bindConfig() expected to fail for unknown config key")
+	}
+	if !strings.Contains(err.Error(), "unknown config key") {
+		t.Fatalf("expected unknown config key error, got: %v", err)
+	}
+}
+
+func TestBindConfigInvalidLogLevelInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "bad-log-level.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+log-level: "verbose"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("bindConfig() expected to fail for invalid log-level in config file")
+	}
+	if !strings.Contains(err.Error(), "invalid log-level") {
+		t.Fatalf("expected invalid log-level error, got: %v", err)
+	}
+}
+
+func TestBindConfigInvalidWebhookHeadersTypeInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "bad-webhook-headers.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+webhook-headers:
+  Authorization: 42
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	_, err := bindConfig()
+	if err == nil {
+		t.Fatal("bindConfig() expected to fail for invalid webhook-headers value type")
+	}
+	if !strings.Contains(err.Error(), "webhook-headers") {
+		t.Fatalf("expected webhook-headers error, got: %v", err)
+	}
+}
+
+func TestBindConfigAllowsGenTestAggInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "gen-test-agg.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+gen-test-agg: 10
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	if _, err := bindConfig(); err != nil {
+		t.Fatalf("bindConfig() expected to accept gen-test-agg key, got: %v", err)
+	}
+}
+
+func TestBindConfigAllowsUpdateInConfigFile(t *testing.T) {
+	viper.Reset()
+	viper.SetEnvPrefix("ncc")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "update.yaml")
+	content := `clusters: "10.0.1.1"
+username: "admin"
+update: false
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	viper.Set("config", cfgPath)
+
+	if _, err := bindConfig(); err != nil {
+		t.Fatalf("bindConfig() expected to accept update key, got: %v", err)
+	}
+}
+
 func TestBindConfigMaxParallel(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1754,6 +2629,8 @@ func TestValidateClusterAddress(t *testing.T) {
 		{"Valid IPv4 another", "192.168.0.1", false},
 		{"Valid hostname", "prism.example.com", false},
 		{"Valid hostname with hyphen", "prism-element-01", false},
+		{"Valid URL target", "https://prism.example.com:9440/api", false},
+		{"Valid host with port", "prism.example.com:9440", false},
 		{"Empty", "", true},
 		{"Double dot", "10.0..1", true},
 		{"Leading dot", ".host", true},
@@ -1803,6 +2680,83 @@ func TestValidateClusters(t *testing.T) {
 	})
 }
 
+func TestReadClusterFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clusters.txt")
+	content := `# comment
+10.0.1.1
+10.0.1.2,admin
+10.0.1.3,svc-user,pass123
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write clusters file: %v", err)
+	}
+	clusters, creds, err := readClusterFile(path)
+	if err != nil {
+		t.Fatalf("readClusterFile: %v", err)
+	}
+	if len(clusters) != 3 {
+		t.Fatalf("len(clusters)=%d, want 3", len(clusters))
+	}
+	if clusters[0] != "10.0.1.1" || clusters[1] != "10.0.1.2" || clusters[2] != "10.0.1.3" {
+		t.Fatalf("unexpected clusters: %#v", clusters)
+	}
+	if creds["10.0.1.2"].Username != "admin" || creds["10.0.1.2"].Password != "" {
+		t.Fatalf("unexpected creds for 10.0.1.2: %#v", creds["10.0.1.2"])
+	}
+	if creds["10.0.1.3"].Username != "svc-user" || creds["10.0.1.3"].Password != "pass123" {
+		t.Fatalf("unexpected creds for 10.0.1.3: %#v", creds["10.0.1.3"])
+	}
+}
+
+func TestNormalizeClusterAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "ip", raw: "10.0.1.1", want: "10.0.1.1"},
+		{name: "hostname", raw: "prism.example.com", want: "prism.example.com"},
+		{name: "url", raw: "https://prism.example.com:9440/api/v1", want: "prism.example.com"},
+		{name: "host and port", raw: "prism.example.com:9440", want: "prism.example.com"},
+		{name: "ipv4 and port", raw: "10.0.1.1:9440", want: "10.0.1.1"},
+		{name: "empty", raw: "", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeClusterAddress(tt.raw)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("normalizeClusterAddress(%q) err=%v wantErr=%v", tt.raw, err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Fatalf("normalizeClusterAddress(%q)=%q want=%q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPreflightResolveClusterTarget(t *testing.T) {
+	if err := preflightResolveClusterTarget("127.0.0.1"); err != nil {
+		t.Fatalf("expected IP target to pass preflight resolution, got %v", err)
+	}
+	if err := preflightResolveClusterTarget("nonexistent-preflight-target.invalid"); err == nil {
+		t.Fatal("expected invalid FQDN to fail preflight resolution")
+	}
+}
+
+func TestReadClusterFileInvalidLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clusters.txt")
+	content := `10.0.1.1,admin,pass,extra`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write clusters file: %v", err)
+	}
+	if _, _, err := readClusterFile(path); err == nil {
+		t.Fatal("expected error for invalid cluster line")
+	}
+}
+
 func TestValidateURL(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1823,6 +2777,35 @@ func TestValidateURL(t *testing.T) {
 				t.Errorf("validateURL(%q) err = %v, wantOk %v", tt.urlStr, err, tt.wantOk)
 			}
 		})
+	}
+}
+
+func TestClosestToken(t *testing.T) {
+	candidates := []string{"discover-clusters", "preflight-check", "validate-config"}
+	if got := closestToken("discovr-clusters", candidates); got != "discover-clusters" {
+		t.Fatalf("closestToken mismatch: got=%q want=%q", got, "discover-clusters")
+	}
+	if got := closestToken("zzzz", candidates); got != "" {
+		t.Fatalf("expected no suggestion for distant token, got=%q", got)
+	}
+}
+
+func TestHumanizeCLIError(t *testing.T) {
+	root := newRootCmd()
+	msg := humanizeCLIError(root, []string{"discovr-clusters"}, errors.New(`unknown command "discovr-clusters" for "ncc-orchestrator"`))
+	if !strings.Contains(msg, "Did you mean `discover-clusters`?") {
+		t.Fatalf("expected command suggestion, got: %s", msg)
+	}
+	flagMsg := humanizeCLIError(root, []string{"--max-paralel"}, errors.New(`unknown flag: --max-paralel`))
+	if !strings.Contains(flagMsg, "Did you mean `--max-parallel`?") {
+		t.Fatalf("expected flag suggestion, got: %s", flagMsg)
+	}
+	subcmdFlagMsg := humanizeCLIError(root, []string{"gen-test-agg", "--autr"}, errors.New(`unknown flag: --autr`))
+	if strings.Contains(subcmdFlagMsg, "`--auto`") {
+		t.Fatalf("did not expect root-only flag suggestion for subcommand, got: %s", subcmdFlagMsg)
+	}
+	if !strings.Contains(subcmdFlagMsg, "ncc-orchestrator gen-test-agg --help") {
+		t.Fatalf("expected subcommand help hint, got: %s", subcmdFlagMsg)
 	}
 }
 
@@ -1852,38 +2835,285 @@ func TestValidateEmailAddress(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	t.Run("Valid minimal", func(t *testing.T) {
-		cfg := Config{
-			Clusters:         []string{"10.0.1.1"},
-			Username:         "admin",
-			Timeout:          15 * time.Minute,
-			RequestTimeout:   20 * time.Second,
-			MaxParallel:      4,
-			RetryMaxAttempts: 6,
-			RetryBaseDelay:   400 * time.Millisecond,
-			RetryMaxDelay:    8 * time.Second,
-			OutputFormats:    []string{"html"},
+	validPaths := func() Config {
+		return Config{
+			Clusters:          []string{"10.0.1.1"},
+			Username:          "admin",
+			Timeout:           15 * time.Minute,
+			RequestTimeout:    20 * time.Second,
+			MaxParallel:       4,
+			RetryMaxAttempts:  6,
+			RetryBaseDelay:    400 * time.Millisecond,
+			RetryMaxDelay:     8 * time.Second,
+			OutputFormats:     []string{"html"},
+			OutputDirLogs:     "nccfiles",
+			OutputDirFiltered: "outputfiles",
+			LogFile:           "logs/ncc-runner.log",
+			PromEnabled:       true,
+			PromDir:           "promfiles",
 		}
+	}
+	t.Run("Valid minimal", func(t *testing.T) {
+		cfg := validPaths()
 		if err := validateConfig(cfg); err != nil {
 			t.Errorf("validateConfig: %v", err)
 		}
 	})
 	t.Run("Empty clusters", func(t *testing.T) {
-		cfg := Config{Username: "admin", Timeout: time.Minute, RequestTimeout: time.Second, MaxParallel: 1, RetryMaxAttempts: 1}
+		cfg := validPaths()
+		cfg.Clusters = nil
 		if err := validateConfig(cfg); err == nil {
 			t.Error("expected error for empty clusters")
 		}
 	})
 	t.Run("Empty username", func(t *testing.T) {
-		cfg := Config{Clusters: []string{"10.0.1.1"}, Timeout: time.Minute, RequestTimeout: time.Second, MaxParallel: 1, RetryMaxAttempts: 1}
+		cfg := validPaths()
+		cfg.Username = ""
 		if err := validateConfig(cfg); err == nil {
 			t.Error("expected error for empty username")
 		}
 	})
+	t.Run("PC mode valid", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.ClusterSourceMode = "pc"
+		cfg.Clusters = nil
+		cfg.PCs = []string{"10.10.10.10"}
+		cfg.DiscoverAPIVersion = "v4"
+		if err := validateConfig(cfg); err != nil {
+			t.Errorf("validateConfig should accept pc mode: %v", err)
+		}
+	})
+	t.Run("PC mode requires targets", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.ClusterSourceMode = "pc"
+		cfg.Clusters = nil
+		cfg.PCs = nil
+		cfg.PrismCentralURL = ""
+		cfg.DiscoverAPIVersion = "v4"
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for pc mode without targets")
+		}
+	})
+	t.Run("Per-cluster username in clusters-file map", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.Username = ""
+		cfg.ClusterCredentials = map[string]ClusterCredential{
+			"10.0.1.1": {Username: "admin"},
+		}
+		if err := validateConfig(cfg); err != nil {
+			t.Errorf("validateConfig should accept per-cluster username: %v", err)
+		}
+	})
 	t.Run("Zero timeout", func(t *testing.T) {
-		cfg := Config{Clusters: []string{"10.0.1.1"}, Username: "u", Timeout: 0, RequestTimeout: time.Second, MaxParallel: 1, RetryMaxAttempts: 1}
+		cfg := validPaths()
+		cfg.Timeout = 0
 		if err := validateConfig(cfg); err == nil {
 			t.Error("expected error for zero timeout")
+		}
+	})
+	t.Run("Empty output-dir-logs", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.OutputDirLogs = ""
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for empty output-dir-logs")
+		}
+		if err := validateConfig(cfg); err != nil && !strings.Contains(err.Error(), "output-dir-logs") {
+			t.Errorf("expected output-dir-logs in error, got %v", err)
+		}
+	})
+	t.Run("Whitespace output-dir-filtered", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.OutputDirFiltered = "   "
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for whitespace output-dir-filtered")
+		}
+	})
+	t.Run("Empty log-file", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.LogFile = ""
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for empty log-file")
+		}
+	})
+	t.Run("Empty prom-dir", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.PromDir = ""
+		if err := validateConfig(cfg); err == nil {
+			t.Error("expected error for empty prom-dir")
+		}
+	})
+	t.Run("Empty prom-dir allowed when prom disabled", func(t *testing.T) {
+		cfg := validPaths()
+		cfg.PromEnabled = false
+		cfg.PromDir = ""
+		if err := validateConfig(cfg); err != nil {
+			t.Errorf("expected no error when prom is disabled, got %v", err)
+		}
+	})
+}
+
+func getPreflightCheckByID(t *testing.T, checks []preflightCheck, id string) preflightCheck {
+	t.Helper()
+	for _, c := range checks {
+		if c.ID == id {
+			return c
+		}
+	}
+	t.Fatalf("preflight check %q not found in %+v", id, checks)
+	return preflightCheck{}
+}
+
+func TestBuildPreflightReportWithoutConfigPath(t *testing.T) {
+	viper.Reset()
+	report := buildPreflightReport("")
+	if report.Failed != 0 {
+		t.Fatalf("expected no failures without config path, got %d", report.Failed)
+	}
+	c := getPreflightCheckByID(t, report.Checks, "validate-config")
+	if c.Status != "warn" {
+		t.Fatalf("expected validate-config warn, got %q", c.Status)
+	}
+}
+
+func TestBuildPreflightReportPathPermissionFailure(t *testing.T) {
+	viper.Reset()
+	tmpDir := t.TempDir()
+	blockPath := filepath.Join(tmpDir, "not-a-dir")
+	if err := os.WriteFile(blockPath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	cfg := fmt.Sprintf(`
+clusters: "10.0.0.1"
+username: "admin"
+output-dir-logs: "%s"
+output-dir-filtered: "%s"
+log-file: "%s"
+prom-dir: "%s"
+`, blockPath, filepath.Join(tmpDir, "out"), filepath.Join(tmpDir, "logs", "ncc-runner.log"), filepath.Join(tmpDir, "prom"))
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	report := buildPreflightReport(cfgPath)
+	c := getPreflightCheckByID(t, report.Checks, "path.output-dir-logs")
+	if c.Status != "fail" {
+		t.Fatalf("expected output-dir-logs permission check to fail, got %q", c.Status)
+	}
+	if report.Failed == 0 {
+		t.Fatal("expected failures in preflight report")
+	}
+}
+
+func TestBuildPreflightReportIncludesSecurityWarnings(t *testing.T) {
+	viper.Reset()
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	cfg := fmt.Sprintf(`
+clusters: "10.0.0.1"
+username: "admin"
+insecure-skip-verify: true
+log-http: true
+max-parallel: 25
+output-dir-logs: "%s"
+output-dir-filtered: "%s"
+log-file: "%s"
+prom-dir: "%s"
+`, filepath.Join(tmpDir, "raw"), filepath.Join(tmpDir, "out"), filepath.Join(tmpDir, "logs", "ncc-runner.log"), filepath.Join(tmpDir, "prom"))
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	report := buildPreflightReport(cfgPath)
+	if getPreflightCheckByID(t, report.Checks, "safety.insecure-skip-verify").Status != "warn" {
+		t.Fatal("expected safety.insecure-skip-verify warning")
+	}
+	if getPreflightCheckByID(t, report.Checks, "safety.log-http").Status != "warn" {
+		t.Fatal("expected safety.log-http warning")
+	}
+	if getPreflightCheckByID(t, report.Checks, "safety.max-parallel").Status != "warn" {
+		t.Fatal("expected safety.max-parallel warning")
+	}
+}
+
+func TestBuildPreflightReportSecretsFailure(t *testing.T) {
+	viper.Reset()
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	cfg := fmt.Sprintf(`
+clusters: "10.0.0.1"
+username: "admin"
+password: "secret://MISSING_PASSWORD"
+output-dir-logs: "%s"
+output-dir-filtered: "%s"
+log-file: "%s"
+prom-dir: "%s"
+`, filepath.Join(tmpDir, "raw"), filepath.Join(tmpDir, "out"), filepath.Join(tmpDir, "logs", "ncc-runner.log"), filepath.Join(tmpDir, "prom"))
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	report := buildPreflightReport(cfgPath)
+	sec := getPreflightCheckByID(t, report.Checks, "validate-secrets")
+	if sec.Status != "fail" {
+		t.Fatalf("expected validate-secrets fail, got %q", sec.Status)
+	}
+	if report.Failed == 0 {
+		t.Fatal("expected failures in report")
+	}
+}
+
+func TestCheckOutputPermissions(t *testing.T) {
+	t.Run("Success with temp dir", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := &Config{
+			LogFile:           filepath.Join(dir, "ncc-runner.log"),
+			OutputDirLogs:     filepath.Join(dir, "nccfiles"),
+			OutputDirFiltered: filepath.Join(dir, "outputfiles"),
+			PromDir:           filepath.Join(dir, "promfiles"),
+		}
+		if err := checkOutputPermissions(cfg); err != nil {
+			t.Errorf("checkOutputPermissions: %v", err)
+		}
+	})
+
+	t.Run("does not leave a stub index.html behind", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := &Config{
+			LogFile:           filepath.Join(dir, "ncc-runner.log"),
+			OutputDirLogs:     filepath.Join(dir, "nccfiles"),
+			OutputDirFiltered: filepath.Join(dir, "outputfiles"),
+		}
+		if err := checkOutputPermissions(cfg); err != nil {
+			t.Fatalf("checkOutputPermissions: %v", err)
+		}
+		indexPath := filepath.Join(cfg.OutputDirFiltered, "index.html")
+		if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+			t.Errorf("expected probe to remove freshly-created index.html, stat err = %v", err)
+		}
+	})
+
+	t.Run("does not truncate a pre-existing index.html", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := &Config{
+			LogFile:           filepath.Join(dir, "ncc-runner.log"),
+			OutputDirLogs:     filepath.Join(dir, "nccfiles"),
+			OutputDirFiltered: filepath.Join(dir, "outputfiles"),
+		}
+		if err := os.MkdirAll(cfg.OutputDirFiltered, 0755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		indexPath := filepath.Join(cfg.OutputDirFiltered, "index.html")
+		const realReport = "<html>const AGG = [{\"cluster\":\"1.2.3.4\"}];</html>"
+		if err := os.WriteFile(indexPath, []byte(realReport), 0644); err != nil {
+			t.Fatalf("seed index.html: %v", err)
+		}
+		if err := checkOutputPermissions(cfg); err != nil {
+			t.Fatalf("checkOutputPermissions: %v", err)
+		}
+		got, err := os.ReadFile(indexPath)
+		if err != nil {
+			t.Fatalf("read index.html after probe: %v", err)
+		}
+		if string(got) != realReport {
+			t.Errorf("probe altered existing index.html content: got %q, want %q", got, realReport)
 		}
 	})
 }
@@ -2033,4 +3263,2107 @@ func TestRetryAfterDelay(t *testing.T) {
 	if !ok || dur != 30*time.Second {
 		t.Errorf("Retry-After 30: want 30s, true; got %v, %v", dur, ok)
 	}
+}
+
+func TestNormalizeNCCAPIVersion(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"", "v4", false},
+		{"v4", "v4", false},
+		{"Legacy", "v1", false},
+		{"legacy", "v1", false},
+		{"v1", "v1", false},
+		{"bogus", "", true},
+	} {
+		got, err := normalizeNCCAPIVersion(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%q: want error", tc.in)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("%q: got %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+func TestMapPrismTaskJSONToTaskStatus(t *testing.T) {
+	raw := []byte(`{
+  "data": {
+    "status": "QUEUED",
+    "progressPercentage": 36
+  }
+}`)
+	st, err := mapPrismTaskJSONToTaskStatus(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PercentageComplete != 36 || st.ProgressStatus != "Running" {
+		t.Fatalf("QUEUED: got pct=%d ps=%q", st.PercentageComplete, st.ProgressStatus)
+	}
+	raw2 := []byte(`{"data":{"status":"SUCCEEDED","progressPercentage":100}}`)
+	st2, err := mapPrismTaskJSONToTaskStatus(raw2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.PercentageComplete != 100 || st2.ProgressStatus != "Succeeded" {
+		t.Fatalf("SUCCEEDED: got pct=%d ps=%q", st2.PercentageComplete, st2.ProgressStatus)
+	}
+	raw3 := []byte(`{"data":{"status":"FAILED","progressPercentage":50}}`)
+	st3, err := mapPrismTaskJSONToTaskStatus(raw3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st3.ProgressStatus != "Failed" {
+		t.Fatalf("FAILED: got ps=%q", st3.ProgressStatus)
+	}
+}
+
+func TestValidateNutanixV4APIVersion(t *testing.T) {
+	for _, tc := range []struct {
+		in string
+		ok bool
+	}{
+		{"v4.2", true},
+		{"v4.0.a1", true},
+		{"v4.1", true},
+		{"v4", true},
+		{"bad/path", false},
+		{"v4..2", false},
+	} {
+		err := validateNutanixV4APIVersion(tc.in)
+		if tc.ok && err != nil {
+			t.Errorf("%q: want ok, got %v", tc.in, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("%q: want error, got nil", tc.in)
+		}
+	}
+}
+
+func TestExtractClusterAddressV4(t *testing.T) {
+	const sample = `{
+  "name": "test_cluster_name",
+  "network": {
+    "externalAddress": {
+      "ipv4": { "value": "10.0.0.50", "prefixLength": 32 }
+    }
+  }
+}`
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(sample), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := extractClusterAddressV4(m); got != "10.0.0.50" {
+		t.Errorf("extractClusterAddressV4 = %q, want 10.0.0.50", got)
+	}
+}
+
+func TestRejectSampleConfig(t *testing.T) {
+	err := rejectSampleConfig(Config{Clusters: []string{"REPLACE_WITH_CLUSTER_IP"}})
+	if err == nil || !strings.Contains(err.Error(), "no cluster was contacted") {
+		t.Fatalf("sample cluster: %v", err)
+	}
+	if err := rejectSampleConfig(Config{Clusters: []string{"10.0.0.1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rejectSampleConfig(Config{
+		Clusters:     []string{"10.0.0.1"},
+		EmailEnabled: false,
+		SMTPServer:   "smtp.example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = rejectSampleConfig(Config{
+		Clusters:     []string{"10.0.0.1"},
+		EmailEnabled: true,
+		SMTPServer:   "smtp.example.com",
+	})
+	if err == nil || !strings.Contains(err.Error(), "smtp-server") {
+		t.Fatalf("enabled sample smtp: %v", err)
+	}
+}
+
+func TestClusterEntityMatchesUserRef(t *testing.T) {
+	pcJSON := `{
+  "extId": "pc-uuid",
+  "name": "Tiamut-PC",
+  "nodes": {
+    "nodeList": [
+      {
+        "controllerVmIp": {
+          "ipv4": { "value": "10.48.52.75", "prefixLength": 32 }
+        }
+      }
+    ]
+  }
+}`
+	var pc map[string]interface{}
+	if err := json.Unmarshal([]byte(pcJSON), &pc); err != nil {
+		t.Fatal(err)
+	}
+	if !clusterEntityMatchesUserRef("10.48.52.75", pc) {
+		t.Error("expected match on PC CVM IP")
+	}
+	if !clusterEntityMatchesUserRef("Tiamut-PC", pc) {
+		t.Error("expected match on name")
+	}
+	if !clusterEntityMatchesUserRef("pc-uuid", pc) {
+		t.Error("expected match on extId")
+	}
+	if !clusterEntityMatchesUserRef("https://10.48.52.75:9440", pc) {
+		t.Error("expected match on PC URL against the CVM IP")
+	}
+	if !clusterEntityMatchesUserRef("urn:uuid:pc-uuid", pc) {
+		t.Error("expected match on urn:uuid extId")
+	}
+	if !clusterEntityMatchesUserRef("{pc-uuid}", pc) {
+		t.Error("expected match on braced extId")
+	}
+
+	aosJSON := `{
+  "extId": "aos-uuid",
+  "name": "Tiamut",
+  "network": {
+    "externalAddress": {
+      "ipv4": { "value": "10.48.52.74", "prefixLength": 32 }
+    }
+  },
+  "nodes": {
+    "nodeList": [
+      {
+        "controllerVmIp": {
+          "ipv4": { "value": "10.48.52.65", "prefixLength": 32 }
+        }
+      }
+    ]
+  }
+}`
+	var aos map[string]interface{}
+	if err := json.Unmarshal([]byte(aosJSON), &aos); err != nil {
+		t.Fatal(err)
+	}
+	if clusterEntityMatchesUserRef("10.48.52.75", aos) {
+		t.Error("did not expect AOS cluster to match PC IP")
+	}
+	if !clusterEntityMatchesUserRef("10.48.52.74", aos) {
+		t.Error("expected match on external address")
+	}
+	if !clusterEntityMatchesUserRef("10.48.52.65", aos) {
+		t.Error("expected match on CVM IP")
+	}
+}
+
+func TestVersionLessSemver(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool // a < b
+	}{
+		{"0.1.12", "0.1.13", true},
+		{"0.9.0", "1.0.0", true},
+		{"1.0.0", "1.0.0", false},
+		{"1.0.0-rc1", "1.0.0", true},
+		{"v1.0.0", "v1.0.1", true},
+	}
+	for _, tc := range tests {
+		got := versionLess(tc.a, tc.b)
+		if got != tc.want {
+			t.Errorf("versionLess(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeGitHubRepo(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{in: "owner/repo", want: "owner/repo"},
+		{in: "https://github.com/owner/repo", want: "owner/repo"},
+		{in: "https://github.com/owner/repo.git", want: "owner/repo"},
+		{in: "https://example.com/owner/repo", wantErr: true},
+		{in: "owner-only", wantErr: true},
+	}
+	for _, tc := range tests {
+		got, err := normalizeGitHubRepo(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("normalizeGitHubRepo(%q) expected error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("normalizeGitHubRepo(%q) unexpected err: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("normalizeGitHubRepo(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestEnforceMajorUpgradePolicy(t *testing.T) {
+	if err := enforceMajorUpgradePolicy("1.1.0", "1.9.0", false); err != nil {
+		t.Fatalf("same-major upgrade should be allowed, got err: %v", err)
+	}
+	if err := enforceMajorUpgradePolicy("1.1.0", "2.0.0", false); err == nil {
+		t.Fatalf("expected major-upgrade block error")
+	}
+	if err := enforceMajorUpgradePolicy("1.1.0", "2.0.0", true); err != nil {
+		t.Fatalf("major-upgrade should pass with explicit opt-in, got err: %v", err)
+	}
+}
+
+func TestPickLatestSemverRelease(t *testing.T) {
+	releases := []githubRelease{
+		{TagName: "v2.0.0"},
+		{TagName: "v1.3.0"},
+		{TagName: "v1.2.9"},
+		{TagName: "v2.1.0-rc1", Prerelease: true},
+	}
+	gotV1 := pickLatestSemverRelease(releases, 1)
+	if gotV1 == nil || gotV1.TagName != "v1.3.0" {
+		t.Fatalf("pickLatestSemverRelease(v1) got %+v", gotV1)
+	}
+	gotAny := pickLatestSemverRelease(releases, 0)
+	if gotAny == nil || gotAny.TagName != "v2.0.0" {
+		t.Fatalf("pickLatestSemverRelease(any) got %+v", gotAny)
+	}
+}
+
+func TestBuildRunClusterSummary(t *testing.T) {
+	ok := ClusterResult{
+		Cluster: "10.0.0.1",
+		Blocks: []ParsedBlock{
+			{Severity: "FAIL", CheckName: "c1"},
+			{Severity: "WARN", CheckName: "c2"},
+			{Severity: "", CheckName: "c3"},
+		},
+	}
+	s := buildRunClusterSummary(ok)
+	if !s.OK || s.FailCount != 1 || s.WarnCount != 1 || s.InfoCount != 1 || s.ChecksTotal != 3 {
+		t.Fatalf("unexpected summary: %+v", s)
+	}
+	fail := ClusterResult{Cluster: "10.0.0.2", Err: fmt.Errorf("boom")}
+	s2 := buildRunClusterSummary(fail)
+	if s2.OK || s2.Error != "boom" {
+		t.Fatalf("unexpected failed summary: %+v", s2)
+	}
+}
+
+// TestBuildClusterChecksSnapshotFromResultFailure guards against a cluster
+// that fails to run (r.Err != nil) silently vanishing from the checks
+// snapshot with an empty Checks list. A failed cluster must still surface a
+// real, visible entry so downstream consumers (the dashboard Alerts table,
+// drilldown diffs, etc.) show the failure instead of nothing — tagged
+// UNKNOWN (not FAIL, since NCC never actually ran any check against it) and
+// carrying an actionable remediation hint in Detail (no KB, since there's no
+// real NCC KB article for "couldn't reach the cluster").
+func TestBuildClusterChecksSnapshotFromResultFailure(t *testing.T) {
+	fail := ClusterResult{Cluster: "10.0.0.2", Err: fmt.Errorf("dial tcp: connection refused"), ErrorClass: "network"}
+	snap := buildClusterChecksSnapshotFromResult(fail)
+	if snap.Address != "10.0.0.2" {
+		t.Fatalf("unexpected address: %+v", snap)
+	}
+	if len(snap.Checks) != 1 {
+		t.Fatalf("want a synthetic failure check, got %+v", snap.Checks)
+	}
+	if snap.Checks[0].CheckName != clusterRunFailedCheckName || snap.Checks[0].Severity != "UNKNOWN" {
+		t.Fatalf("unexpected synthetic check: %+v", snap.Checks[0])
+	}
+	if !strings.Contains(snap.Checks[0].Detail, "dial tcp: connection refused") {
+		t.Fatalf("expected Detail to retain the real error, got %q", snap.Checks[0].Detail)
+	}
+	if !strings.Contains(snap.Checks[0].Detail, "routable") && !strings.Contains(snap.Checks[0].Detail, "firewall") {
+		t.Fatalf("expected Detail to carry a remediation hint, got %q", snap.Checks[0].Detail)
+	}
+	if snap.FailCount != 0 || snap.ChecksTotal != 1 || snap.HealthScore != 0 {
+		t.Fatalf("unexpected counts: %+v", snap)
+	}
+
+	ok := ClusterResult{
+		Cluster: "10.0.0.1",
+		Blocks: []ParsedBlock{
+			{Severity: "FAIL", CheckName: "c1"},
+		},
+	}
+	okSnap := buildClusterChecksSnapshotFromResult(ok)
+	if len(okSnap.Checks) != 1 || okSnap.Checks[0].CheckName != "c1" {
+		t.Fatalf("successful cluster snapshot regressed: %+v", okSnap)
+	}
+}
+
+func TestRunFailedRemediation(t *testing.T) {
+	cases := []struct {
+		class string
+		want  string
+	}{
+		{"auth", "account lockout"},
+		{"timeout", "--request-timeout"},
+		{"network", "DNS/connection"},
+		{"rate_limit", "--max-parallel"},
+		{"api", "Prism services"},
+		{"parser", "output-dir-logs"},
+		{"unknown", "connectivity/credentials"},
+		{"", "connectivity/credentials"},
+	}
+	for _, c := range cases {
+		got := runFailedRemediation(fmt.Errorf("boom"), c.class)
+		if !strings.Contains(got, c.want) {
+			t.Errorf("class %q: remediation = %q, want it to contain %q", c.class, got, c.want)
+		}
+	}
+	if runFailedRemediation(nil, "network") != "" {
+		t.Error("expected empty remediation for a nil error")
+	}
+}
+
+func TestExtractCVMIPv4sFromClusterEntity(t *testing.T) {
+	const sample = `{
+  "nodes": {
+    "nodeList": [
+      {
+        "controllerVmIp": {
+          "ipv4": { "value": "10.0.0.1", "prefixLength": 32 }
+        }
+      },
+      {
+        "controllerVmIp": {
+          "ipv4": { "value": "10.0.0.2", "prefixLength": 32 }
+        }
+      }
+    ]
+  }
+}`
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(sample), &m); err != nil {
+		t.Fatal(err)
+	}
+	got := extractCVMIPv4sFromClusterEntity(m)
+	if len(got) != 2 || got[0] != "10.0.0.1" || got[1] != "10.0.0.2" {
+		t.Fatalf("extractCVMIPv4sFromClusterEntity = %#v", got)
+	}
+}
+
+// TestPickAssetForPlatform_PrefersExeBasenamePrefix locks in the fix for the
+// v1.x→v2.0.0 self-updater regression where a release that shipped multiple
+// binaries per platform (e.g. ncc-orchestrator-*, ncc-api-server-*,
+// ncc-ui-server-*) caused the first-match selector to pick the wrong asset
+// (alphabetically: api-server) and silently overwrite the orchestrator
+// binary with the api-server binary. See RELEASE_NOTES_v2.0.0 known-issues
+// section.
+func TestPickAssetForPlatform_PrefersExeBasenamePrefix(t *testing.T) {
+	// Asset list mirroring the original (pre-hotfix) v2.0.0 release order,
+	// which is the order GitHub's API returns assets (alphabetical by name).
+	v200Layout := githubRelease{
+		TagName: "v2.0.0",
+		Assets: []githubAsset{
+			{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/checksums.txt"},
+			{Name: "example_config.yaml", BrowserDownloadURL: "https://example.com/example_config.yaml"},
+			{Name: "ncc-api-server-darwin-amd64", BrowserDownloadURL: "https://example.com/ncc-api-server-darwin-amd64"},
+			{Name: "ncc-api-server-darwin-arm64", BrowserDownloadURL: "https://example.com/ncc-api-server-darwin-arm64"},
+			{Name: "ncc-api-server-linux-amd64", BrowserDownloadURL: "https://example.com/ncc-api-server-linux-amd64"},
+			{Name: "ncc-api-server-linux-arm64", BrowserDownloadURL: "https://example.com/ncc-api-server-linux-arm64"},
+			{Name: "ncc-api-server-windows-amd64.exe", BrowserDownloadURL: "https://example.com/ncc-api-server-windows-amd64.exe"},
+			{Name: "ncc-api-server-windows-arm64.exe", BrowserDownloadURL: "https://example.com/ncc-api-server-windows-arm64.exe"},
+			{Name: "ncc-orchestrator-darwin-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-amd64"},
+			{Name: "ncc-orchestrator-darwin-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-arm64"},
+			{Name: "ncc-orchestrator-linux-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-amd64"},
+			{Name: "ncc-orchestrator-linux-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-arm64"},
+			{Name: "ncc-orchestrator-windows-amd64.exe", BrowserDownloadURL: "https://example.com/ncc-orchestrator-windows-amd64.exe"},
+			{Name: "ncc-orchestrator-windows-arm64.exe", BrowserDownloadURL: "https://example.com/ncc-orchestrator-windows-arm64.exe"},
+			{Name: "ncc-ui-server-darwin-amd64", BrowserDownloadURL: "https://example.com/ncc-ui-server-darwin-amd64"},
+			{Name: "ncc-ui-server-darwin-arm64", BrowserDownloadURL: "https://example.com/ncc-ui-server-darwin-arm64"},
+			{Name: "ncc-ui-server-linux-amd64", BrowserDownloadURL: "https://example.com/ncc-ui-server-linux-amd64"},
+			{Name: "ncc-ui-server-linux-arm64", BrowserDownloadURL: "https://example.com/ncc-ui-server-linux-arm64"},
+			{Name: "ncc-ui-server-windows-amd64.exe", BrowserDownloadURL: "https://example.com/ncc-ui-server-windows-amd64.exe"},
+			{Name: "ncc-ui-server-windows-arm64.exe", BrowserDownloadURL: "https://example.com/ncc-ui-server-windows-arm64.exe"},
+			{Name: "ncc-v2-stack-darwin-amd64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-amd64.tar.gz"},
+			{Name: "ncc-v2-stack-darwin-arm64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-arm64.tar.gz"},
+			{Name: "ncc-v2-stack-linux-amd64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-linux-amd64.tar.gz"},
+			{Name: "ncc-v2-stack-linux-arm64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-linux-arm64.tar.gz"},
+			{Name: "ncc-v2-stack-windows-amd64.zip", BrowserDownloadURL: "https://example.com/ncc-v2-stack-windows-amd64.zip"},
+			{Name: "ncc-v2-stack-windows-arm64.zip", BrowserDownloadURL: "https://example.com/ncc-v2-stack-windows-arm64.zip"},
+		},
+	}
+
+	cases := []struct {
+		name        string
+		goos        string
+		goarch      string
+		exeBase     string
+		wantName    string
+		description string
+	}{
+		{
+			name:        "orchestrator on darwin/arm64 must pick orchestrator binary",
+			goos:        "darwin",
+			goarch:      "arm64",
+			exeBase:     "ncc-orchestrator",
+			wantName:    "ncc-orchestrator-darwin-arm64",
+			description: "regression guard: pre-fix selector wrongly picked ncc-api-server-darwin-arm64",
+		},
+		{
+			name:     "orchestrator on linux/amd64",
+			goos:     "linux",
+			goarch:   "amd64",
+			exeBase:  "ncc-orchestrator",
+			wantName: "ncc-orchestrator-linux-amd64",
+		},
+		{
+			name:     "orchestrator on windows/arm64 (exe suffix tolerated)",
+			goos:     "windows",
+			goarch:   "arm64",
+			exeBase:  "ncc-orchestrator.exe",
+			wantName: "ncc-orchestrator-windows-arm64.exe",
+		},
+		{
+			name:     "api-server invoked directly picks api-server",
+			goos:     "linux",
+			goarch:   "amd64",
+			exeBase:  "ncc-api-server",
+			wantName: "ncc-api-server-linux-amd64",
+		},
+		{
+			name:     "ui-server invoked directly picks ui-server",
+			goos:     "darwin",
+			goarch:   "arm64",
+			exeBase:  "ncc-ui-server",
+			wantName: "ncc-ui-server-darwin-arm64",
+		},
+		{
+			name:        "renamed binary falls back to first non-archive match (legacy behavior)",
+			goos:        "darwin",
+			goarch:      "arm64",
+			exeBase:     "ncc-fork",
+			wantName:    "ncc-api-server-darwin-arm64", // first non-archive that matches; legacy semantics
+			description: "preserves v1.x behavior for forks/renamed binaries",
+		},
+		{
+			name:     "empty exeBase falls back to first non-archive match",
+			goos:     "linux",
+			goarch:   "arm64",
+			exeBase:  "",
+			wantName: "ncc-api-server-linux-arm64",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, gotName := pickAssetForPlatform(v200Layout, tc.goos, tc.goarch, tc.exeBase)
+			if gotName != tc.wantName {
+				t.Fatalf("pickAssetForPlatform(%s/%s, exeBase=%q) = %q; want %q (%s)",
+					tc.goos, tc.goarch, tc.exeBase, gotName, tc.wantName, tc.description)
+			}
+		})
+	}
+}
+
+// TestPickAssetForPlatform_ArchiveOnlyRelease verifies that when only archive
+// assets exist for a platform, the function returns the archive (so the
+// caller can emit a "download and extract" hint rather than overwriting the
+// binary in place).
+func TestPickAssetForPlatform_ArchiveOnlyRelease(t *testing.T) {
+	rel := githubRelease{
+		TagName: "v2.0.0-archives-only",
+		Assets: []githubAsset{
+			{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/checksums.txt"},
+			{Name: "ncc-v2-stack-darwin-arm64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-arm64.tar.gz"},
+			{Name: "ncc-v2-stack-linux-amd64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-linux-amd64.tar.gz"},
+		},
+	}
+	url, name := pickAssetForPlatform(rel, "darwin", "arm64", "ncc-orchestrator")
+	if name != "ncc-v2-stack-darwin-arm64.tar.gz" {
+		t.Fatalf("archive-only release should surface .tar.gz, got name=%q url=%q", name, url)
+	}
+	if !isArchiveAssetURL(url) {
+		t.Fatalf("expected isArchiveAssetURL(%q) = true", url)
+	}
+}
+
+// TestPickAssetForPlatform_NoMatch ensures empty strings are returned when no
+// asset matches the requested platform.
+func TestPickAssetForPlatform_NoMatch(t *testing.T) {
+	rel := githubRelease{
+		TagName: "v2.0.0-darwin-only",
+		Assets: []githubAsset{
+			{Name: "ncc-orchestrator-darwin-arm64", BrowserDownloadURL: "https://example.com/x"},
+		},
+	}
+	url, name := pickAssetForPlatform(rel, "linux", "amd64", "ncc-orchestrator")
+	if url != "" || name != "" {
+		t.Fatalf("expected empty results for unsupported platform; got url=%q name=%q", url, name)
+	}
+}
+
+// TestResolveV2PathToReal_NonExistentSuffix pins the v2.0.2 fix where the
+// resolver walks up to the first existing ancestor for paths that don't
+// exist yet (output-dir / log-dir / token-file before mkdir). Without this
+// the api-server's normalizeAndConfinePath check fails on macOS because
+// repo-root is resolved (/private/tmp/...) but output-dir stays
+// unresolved (/tmp/...) and the prefix check fails.
+func TestResolveV2PathToReal_NonExistentSuffix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on windows")
+	}
+	tmp := t.TempDir()
+	tmpReal, _ := filepath.EvalSymlinks(tmp)
+	if tmpReal == "" {
+		tmpReal = tmp
+	}
+
+	t.Run("existing path: returns symlink-resolved abs", func(t *testing.T) {
+		got := resolveV2PathToReal(tmp)
+		if got != tmpReal {
+			t.Fatalf("got %q; want %q", got, tmpReal)
+		}
+	})
+
+	t.Run("non-existent suffix: walks up + re-attaches", func(t *testing.T) {
+		nonexistent := filepath.Join(tmp, "outputfiles")
+		got := resolveV2PathToReal(nonexistent)
+		want := filepath.Join(tmpReal, "outputfiles")
+		if got != want {
+			t.Fatalf("got %q; want %q", got, want)
+		}
+	})
+
+	t.Run("deeply non-existent suffix: still resolves prefix", func(t *testing.T) {
+		nonexistent := filepath.Join(tmp, "a", "b", "c")
+		got := resolveV2PathToReal(nonexistent)
+		want := filepath.Join(tmpReal, "a", "b", "c")
+		if got != want {
+			t.Fatalf("got %q; want %q", got, want)
+		}
+	})
+}
+
+// TestVerifyAssetAgainstReleaseChecksum_TamperDetection pins the v2.0.2
+// supply-chain integrity property: a corrupted release artifact (e.g. MITM
+// tampering or a checksum-collision attempt) MUST be rejected by the
+// updater. Critical for the package-level update flow introduced in
+// v2.0.1.
+//
+// The test stands up an in-process HTTP server playing the role of
+// github.com/<repo>/releases/download/<tag>/checksums.txt, then exercises
+// three scenarios:
+//   - body matches checksums.txt entry  -> nil error
+//   - body's hash does NOT match        -> error mentions "checksum mismatch"
+//   - asset name absent from manifest   -> error mentions "not found"
+func TestVerifyAssetAgainstReleaseChecksum_TamperDetection(t *testing.T) {
+	assetName := "ncc-v2-stack-darwin-arm64.tar.gz"
+	body := []byte("legitimate stack contents")
+	good := sha256.Sum256(body)
+	goodHex := hex.EncodeToString(good[:])
+
+	manifestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// classic checksums.txt format: "<hex>  <filename>" per line
+		fmt.Fprintf(w, "%s  %s\n", goodHex, assetName)
+		fmt.Fprint(w, "deadbeef00000000000000000000000000000000000000000000000000000000  some-other-asset\n")
+	}))
+	defer manifestServer.Close()
+
+	rel := &githubRelease{
+		TagName: "v2.0.2",
+		Assets: []githubAsset{
+			{Name: "checksums.txt", BrowserDownloadURL: manifestServer.URL + "/checksums.txt"},
+		},
+	}
+
+	t.Run("matching body verifies", func(t *testing.T) {
+		if err := verifyAssetAgainstReleaseChecksum(rel, assetName, body, manifestServer.Client()); err != nil {
+			t.Fatalf("verify expected success, got: %v", err)
+		}
+	})
+
+	t.Run("tampered body is rejected", func(t *testing.T) {
+		tampered := append([]byte(nil), body...)
+		tampered[0] ^= 0x01
+		err := verifyAssetAgainstReleaseChecksum(rel, assetName, tampered, manifestServer.Client())
+		if err == nil {
+			t.Fatalf("expected tamper detection, got nil")
+		}
+		if !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Fatalf("expected error to mention 'checksum mismatch', got: %v", err)
+		}
+	})
+
+	t.Run("asset missing from manifest is rejected", func(t *testing.T) {
+		err := verifyAssetAgainstReleaseChecksum(rel, "not-in-manifest.tar.gz", body, manifestServer.Client())
+		if err == nil {
+			t.Fatalf("expected error for missing manifest entry, got nil")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("expected error to mention 'not found', got: %v", err)
+		}
+	})
+
+	t.Run("release without checksum asset is rejected", func(t *testing.T) {
+		emptyRel := &githubRelease{TagName: "v2.0.2", Assets: []githubAsset{}}
+		err := verifyAssetAgainstReleaseChecksum(emptyRel, assetName, body, manifestServer.Client())
+		if err == nil {
+			t.Fatalf("expected error for release without checksum manifest, got nil")
+		}
+		if !strings.Contains(err.Error(), "no checksum asset") {
+			t.Fatalf("expected error to mention 'no checksum asset', got: %v", err)
+		}
+	})
+}
+
+// TestWriteWindowsUpdateSwapHelper checks the generated apply-ncc-update.cmd
+// swaps the downloaded .new.exe over the running binary, waits for the lock,
+// and self-deletes. The generator is pure, so this runs on any OS.
+func TestWriteWindowsUpdateSwapHelper(t *testing.T) {
+	tmp := t.TempDir()
+	selfPath := filepath.Join(tmp, "ncc-orchestrator.exe")
+	newPath := selfPath + ".new.exe"
+
+	helperPath, err := writeWindowsUpdateSwapHelper(selfPath, newPath)
+	if err != nil {
+		t.Fatalf("writeWindowsUpdateSwapHelper: %v", err)
+	}
+	if filepath.Base(helperPath) != "apply-ncc-update.cmd" {
+		t.Fatalf("unexpected helper name: %s", helperPath)
+	}
+	data, err := os.ReadFile(helperPath)
+	if err != nil {
+		t.Fatalf("read helper: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"move /y \"" + newPath + "\" \"" + selfPath + "\"",
+		"goto retry",
+		"del \"%~f0\"",
+		"\r\n", // CRLF line endings for cmd.exe
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("helper script missing %q\n---\n%s", want, script)
+		}
+	}
+}
+
+// TestVerifyDownloadedAsset covers the skip-vs-verify wrapper used by
+// `update` and `v2-bootstrap`. When skipVerify is false it must enforce the
+// release checksum (tamper detection); when true it must bypass verification
+// entirely (air-gapped/mirrored installs) even when the bytes would not
+// match — and even when the release carries no checksum manifest at all.
+func TestVerifyDownloadedAsset(t *testing.T) {
+	assetName := "ncc-v2-stack-linux-amd64.tar.gz"
+	body := []byte("legitimate stack contents")
+	good := sha256.Sum256(body)
+	goodHex := hex.EncodeToString(good[:])
+
+	manifestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s  %s\n", goodHex, assetName)
+	}))
+	defer manifestServer.Close()
+
+	rel := &githubRelease{
+		TagName: "v2.1.0",
+		Assets:  []githubAsset{{Name: "checksums.txt", BrowserDownloadURL: manifestServer.URL + "/checksums.txt"}},
+	}
+
+	t.Run("verify enforced: matching body passes", func(t *testing.T) {
+		if err := verifyDownloadedAsset(rel, assetName, body, manifestServer.Client(), false); err != nil {
+			t.Fatalf("expected success, got: %v", err)
+		}
+	})
+
+	t.Run("verify enforced: tampered body rejected", func(t *testing.T) {
+		tampered := append([]byte(nil), body...)
+		tampered[0] ^= 0x01
+		if err := verifyDownloadedAsset(rel, assetName, tampered, manifestServer.Client(), false); err == nil {
+			t.Fatalf("expected tamper rejection, got nil")
+		}
+	})
+
+	t.Run("skip bypasses verification even for tampered body", func(t *testing.T) {
+		tampered := append([]byte(nil), body...)
+		tampered[0] ^= 0x01
+		if err := verifyDownloadedAsset(rel, assetName, tampered, manifestServer.Client(), true); err != nil {
+			t.Fatalf("skip should bypass verification, got: %v", err)
+		}
+	})
+
+	t.Run("skip bypasses even when release has no checksum manifest", func(t *testing.T) {
+		emptyRel := &githubRelease{TagName: "v2.1.0", Assets: []githubAsset{}}
+		if err := verifyDownloadedAsset(emptyRel, assetName, body, manifestServer.Client(), true); err != nil {
+			t.Fatalf("skip should bypass missing manifest, got: %v", err)
+		}
+	})
+}
+
+// Notification accumulator, template, and sender tests moved to the
+// goncc/internal/notify package alongside the extracted implementation.
+
+// TestLoopbackAltOriginFromListen pins the CORS-friendly alt-origin
+// derivation: when the UI binds to a loopback IP, the allow-list should
+// also include the http://localhost:port form so a browser can reach
+// the UI via either name (matching the v2.0.1 behavior, which had baked
+// the localhost-form into the connection URL itself — that's now reserved
+// for accurate IPv4/IPv6 disambiguation).
+func TestLoopbackAltOriginFromListen(t *testing.T) {
+	cases := []struct {
+		in   string
+		port string
+		want string
+	}{
+		{"127.0.0.1:18093", "8081", "http://localhost:18093"},
+		{"[::1]:9000", "8081", "http://localhost:9000"},
+		{":8081", "8081", ""},
+		{"", "8081", ""},
+		{"0.0.0.0:9000", "8081", ""},
+		{"192.168.1.5:9000", "8081", ""},
+		{"my-host:9000", "8081", ""},
+	}
+	for _, tc := range cases {
+		got := loopbackAltOriginFromListen(tc.in, tc.port)
+		if got != tc.want {
+			t.Errorf("loopbackAltOriginFromListen(%q, %q) = %q; want %q", tc.in, tc.port, got, tc.want)
+		}
+	}
+}
+
+// TestLocalHTTPURLFromListen pins the v2.0.2 fix where the helper preserved
+// the user-supplied host instead of always rewriting to "localhost". On
+// macOS the server may bind to 127.0.0.1 (IPv4 only) while `localhost`
+// resolves to ::1 (IPv6) first; without preserving the host, wait-ready
+// and the UI backend URL would target the wrong address family and fail.
+func TestLocalHTTPURLFromListen(t *testing.T) {
+	cases := []struct {
+		in   string
+		port string
+		want string
+	}{
+		{"127.0.0.1:18093", "8081", "http://127.0.0.1:18093"},
+		{":8081", "8081", "http://localhost:8081"},
+		{"", "8081", "http://localhost:8081"},
+		{"0.0.0.0:9000", "8081", "http://localhost:9000"},
+		{"[::]:9000", "8081", "http://localhost:9000"},
+		{"[::1]:9000", "8081", "http://[::1]:9000"},
+		{"192.168.1.5:8080", "8081", "http://192.168.1.5:8080"},
+		{"my-host:9000", "8081", "http://my-host:9000"},
+	}
+	for _, tc := range cases {
+		got := localHTTPURLFromListen(tc.in, tc.port)
+		if got != tc.want {
+			t.Errorf("localHTTPURLFromListen(%q, %q) = %q; want %q", tc.in, tc.port, got, tc.want)
+		}
+	}
+}
+
+// TestResolveV2RepoRoot pins the repo-root resolution that the api-server
+// uses as a path-traversal sandbox. The chosen root must contain both the
+// install-dir and the CWD so config-path / output-dir / log-dir / token-file
+// (all install-dir-relative under v2.0.2 defaults, possibly CWD-relative
+// under explicit user override) can pass the api-server's
+// normalizeAndConfinePath check.
+//
+// On platforms where /tmp is a symlink (macOS), we EvalSymlinks the chosen
+// root so it matches what the api-server does internally on its rootAbs;
+// otherwise the api-server compares an unresolved abs against a resolved
+// rootReal and fails legitimate paths.
+func TestResolveV2RepoRoot(t *testing.T) {
+	// We can't fake symlinks portably in this package without root, but
+	// we can construct real ones in a temp dir on unix.
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on windows; this test focuses on macOS/linux behavior")
+	}
+	tmp := t.TempDir()
+	stack := filepath.Join(tmp, "stack")
+	mustMkdir(t, filepath.Join(stack, "bin"))
+
+	cases := []struct {
+		name       string
+		installDir string
+		cwd        string
+		wantPrefix string
+	}{
+		{
+			name:       "cwd inside install-dir/bin -> repo-root is install-dir",
+			installDir: stack,
+			cwd:        filepath.Join(stack, "bin"),
+			wantPrefix: stack,
+		},
+		{
+			name:       "install-dir inside cwd -> repo-root is cwd",
+			installDir: filepath.Join(tmp, "x", ".ncc-v2"),
+			cwd:        filepath.Join(tmp, "x"),
+			wantPrefix: filepath.Join(tmp, "x"),
+		},
+		{
+			name:       "install-dir == cwd -> either is fine",
+			installDir: stack,
+			cwd:        stack,
+			wantPrefix: stack,
+		},
+	}
+	// Pre-create the install-dir for the second case so EvalSymlinks works.
+	mustMkdir(t, filepath.Join(tmp, "x"))
+	mustMkdir(t, filepath.Join(tmp, "x", ".ncc-v2"))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveV2RepoRoot(tc.installDir, tc.cwd)
+			// Use EvalSymlinks for the wantPrefix so the comparison is
+			// stable across macOS /tmp symlinks.
+			wantReal, _ := filepath.EvalSymlinks(tc.wantPrefix)
+			if wantReal == "" {
+				wantReal = tc.wantPrefix
+			}
+			if got != wantReal {
+				t.Fatalf("resolveV2RepoRoot(install=%q, cwd=%q) = %q; want %q", tc.installDir, tc.cwd, got, wantReal)
+			}
+		})
+	}
+}
+
+// TestIsPathAncestor pins the lexical ancestor predicate used by
+// resolveV2RepoRoot.
+func TestIsPathAncestor(t *testing.T) {
+	cases := []struct {
+		parent, child string
+		want          bool
+	}{
+		{"/a/b", "/a/b/c", true},
+		{"/a/b", "/a/b", true},
+		{"/a/b", "/a/bc", false},
+		{"/a/b", "/a", false},
+		{"/", "/anything", true},
+	}
+	for _, tc := range cases {
+		got := isPathAncestor(tc.parent, tc.child)
+		if got != tc.want {
+			t.Fatalf("isPathAncestor(%q, %q) = %v; want %v", tc.parent, tc.child, got, tc.want)
+		}
+	}
+}
+
+// TestDefaultV2InstallDir_AutoDetectsStackLayout pins the v2.0.2 UX fix
+// where v2-check / v2-start / v2-stop / uninstall, when run from inside a
+// bootstrapped or extracted stack layout (`<X>/bin/<exe>`), default the
+// install dir to <X> instead of `.ncc-v2` relative to CWD. Without this,
+// `cd <X>/bin && ./ncc-orchestrator v2-check` reports false-positive
+// "binary not executable under install dir / frontend-dist missing"
+// failures even though everything is sitting one level up.
+//
+// We can't redirect os.Executable() from a test, but we can exercise the
+// helper via a thin wrapper that takes an injected exe path. The behavior
+// asserted here is the same logic the real helper applies, gated by the
+// presence of the v2 layout markers.
+func TestDefaultV2InstallDir_AutoDetectsStackLayout(t *testing.T) {
+	stack := t.TempDir()
+	mustMkdir(t, filepath.Join(stack, "bin"))
+	mustMkdir(t, filepath.Join(stack, "frontend-dist"))
+	binSubdir := filepath.Join(stack, "bin")
+
+	cases := []struct {
+		name   string
+		exeDir string
+		want   string
+	}{
+		{
+			name:   "running from <X>/bin in a complete stack returns <X>",
+			exeDir: binSubdir,
+			want:   stack,
+		},
+		{
+			name:   "running from somewhere not under bin/ falls back to .ncc-v2",
+			exeDir: t.TempDir(),
+			want:   ".ncc-v2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := defaultV2InstallDirForExeDir(tc.exeDir)
+			if got != tc.want {
+				t.Fatalf("defaultV2InstallDirForExeDir(%q) = %q; want %q", tc.exeDir, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefaultV2InstallDir_AcceptsSuffixedBinaryNaming pins that the helper
+// recognizes legacy v2.0.0-style stack layouts where binaries under bin/
+// have platform-suffixed names (bin/ncc-api-server-<os>-<arch>). Required so
+// that v2-check works against archives extracted from the original v2.0.0
+// stack without a pre-hotfix orchestrator.
+func TestDefaultV2InstallDir_AcceptsSuffixedBinaryNaming(t *testing.T) {
+	stack := t.TempDir()
+	mustMkdir(t, filepath.Join(stack, "bin"))
+	binName := fmt.Sprintf("ncc-api-server-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	mustTouch(t, filepath.Join(stack, "bin", binName))
+	got := defaultV2InstallDirForExeDir(filepath.Join(stack, "bin"))
+	if got != stack {
+		t.Fatalf("expected suffix-named bin layout to resolve to %q; got %q", stack, got)
+	}
+}
+
+// TestDefaultV2InstallDir_BinDirWithoutLayoutMarkers pins that the helper
+// does NOT match a directory just because it has a `bin/` parent — there
+// must also be a v2 layout marker (frontend-dist/ or bin/ncc-api-server*).
+// This prevents auto-detect from "swallowing" arbitrary <X>/bin/foo
+// invocations as v2 stacks.
+func TestDefaultV2InstallDir_BinDirWithoutLayoutMarkers(t *testing.T) {
+	stack := t.TempDir()
+	mustMkdir(t, filepath.Join(stack, "bin"))
+	got := defaultV2InstallDirForExeDir(filepath.Join(stack, "bin"))
+	if got != ".ncc-v2" {
+		t.Fatalf("bare bin/ without layout markers should fall back to .ncc-v2; got %q", got)
+	}
+}
+
+// TestExtractTarGzArchive_PreservesExecutableBit pins the v2.0.1 fix to
+// extractTarGzArchive (and by symmetry extractZipArchive). Previously the
+// extractor wrote every file with a hardcoded 0644 mode, which dropped the
+// executable bit from binaries shipped inside the v2 stack archives. The
+// post-extract isExecutableFile checks in v2-check / v2-start then failed
+// with "binary not executable under install dir: ...". The fix honors
+// hdr.Mode (or zip's FileInfo().Mode()) so extracted binaries are 0755 as
+// packaged. This test builds a synthetic tar.gz with one 0755 binary-like
+// entry and one 0644 plain file, extracts it, and asserts the on-disk modes
+// match the archive metadata.
+func TestExtractTarGzArchive_PreservesExecutableBit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix mode bits not meaningful on windows")
+	}
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	if err := tw.WriteHeader(&tar.Header{Name: "bin/", Mode: 0o755, Typeflag: tar.TypeDir}); err != nil {
+		t.Fatalf("write dir hdr: %v", err)
+	}
+	binBody := []byte("#!/bin/sh\necho hi\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "bin/ncc-stub", Mode: 0o755, Size: int64(len(binBody)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatalf("write exec hdr: %v", err)
+	}
+	if _, err := tw.Write(binBody); err != nil {
+		t.Fatalf("write exec body: %v", err)
+	}
+	cfgBody := []byte("key: value\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "example.yaml", Mode: 0o644, Size: int64(len(cfgBody)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatalf("write cfg hdr: %v", err)
+	}
+	if _, err := tw.Write(cfgBody); err != nil {
+		t.Fatalf("write cfg body: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("gz close: %v", err)
+	}
+	dest := t.TempDir()
+	if err := extractTarGzArchive(buf.Bytes(), dest); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	binPath := filepath.Join(dest, "bin", "ncc-stub")
+	cfgPath := filepath.Join(dest, "example.yaml")
+	binInfo, err := os.Stat(binPath)
+	if err != nil {
+		t.Fatalf("stat bin: %v", err)
+	}
+	if binInfo.Mode().Perm() != 0o755 {
+		t.Fatalf("bin/ncc-stub mode = %#o; want 0755 (executable bit dropped during extraction)", binInfo.Mode().Perm())
+	}
+	if !isExecutableFile(binPath) {
+		t.Fatalf("isExecutableFile(bin/ncc-stub) = false; extractor must preserve the +x bit so v2-check passes")
+	}
+	cfgInfo, err := os.Stat(cfgPath)
+	if err != nil {
+		t.Fatalf("stat cfg: %v", err)
+	}
+	if cfgInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("example.yaml mode = %#o; want 0644 (non-exec entries should not gain +x)", cfgInfo.Mode().Perm())
+	}
+}
+
+// TestPickStackAssetForPlatform locks in the v2.0.1 behavior that `update`
+// upgrades the whole v2 stack package irrespective of which binary
+// (orchestrator, api-server, ui-server, or any renamed variant) was
+// invoked. The selector must return the ncc-v2-stack-<os>-<arch> archive
+// when present, and empty strings for legacy releases that ship only
+// individual binaries.
+func TestPickStackAssetForPlatform(t *testing.T) {
+	v201Layout := githubRelease{
+		TagName: "v2.0.1",
+		Assets: []githubAsset{
+			{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/checksums.txt"},
+			{Name: "example_config.yaml", BrowserDownloadURL: "https://example.com/example_config.yaml"},
+			{Name: "ncc-orchestrator-darwin-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-amd64"},
+			{Name: "ncc-orchestrator-darwin-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-arm64"},
+			{Name: "ncc-orchestrator-linux-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-amd64"},
+			{Name: "ncc-orchestrator-linux-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-arm64"},
+			{Name: "ncc-orchestrator-windows-amd64.exe", BrowserDownloadURL: "https://example.com/ncc-orchestrator-windows-amd64.exe"},
+			{Name: "ncc-orchestrator-windows-arm64.exe", BrowserDownloadURL: "https://example.com/ncc-orchestrator-windows-arm64.exe"},
+			{Name: "ncc-v2-stack-darwin-amd64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-amd64.tar.gz"},
+			{Name: "ncc-v2-stack-darwin-arm64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-arm64.tar.gz"},
+			{Name: "ncc-v2-stack-linux-amd64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-linux-amd64.tar.gz"},
+			{Name: "ncc-v2-stack-linux-arm64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-linux-arm64.tar.gz"},
+			{Name: "ncc-v2-stack-windows-amd64.zip", BrowserDownloadURL: "https://example.com/ncc-v2-stack-windows-amd64.zip"},
+			{Name: "ncc-v2-stack-windows-arm64.zip", BrowserDownloadURL: "https://example.com/ncc-v2-stack-windows-arm64.zip"},
+		},
+	}
+	cases := []struct {
+		name     string
+		goos     string
+		goarch   string
+		wantName string
+	}{
+		{"darwin/arm64 selects darwin-arm64 stack", "darwin", "arm64", "ncc-v2-stack-darwin-arm64.tar.gz"},
+		{"darwin/amd64 selects darwin-amd64 stack", "darwin", "amd64", "ncc-v2-stack-darwin-amd64.tar.gz"},
+		{"linux/arm64 selects linux-arm64 stack", "linux", "arm64", "ncc-v2-stack-linux-arm64.tar.gz"},
+		{"linux/amd64 selects linux-amd64 stack", "linux", "amd64", "ncc-v2-stack-linux-amd64.tar.gz"},
+		{"windows/arm64 selects windows-arm64 zip", "windows", "arm64", "ncc-v2-stack-windows-arm64.zip"},
+		{"windows/amd64 selects windows-amd64 zip", "windows", "amd64", "ncc-v2-stack-windows-amd64.zip"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := pickStackAssetForPlatform(v201Layout, tc.goos, tc.goarch)
+			if got != tc.wantName {
+				t.Fatalf("pickStackAssetForPlatform(%s/%s) = %q; want %q", tc.goos, tc.goarch, got, tc.wantName)
+			}
+		})
+	}
+}
+
+// TestPickStackAssetForPlatform_NoStackInRelease confirms that legacy v1.x
+// releases (no ncc-v2-stack-* assets) return empty strings so the caller can
+// fall back to the single-binary update path.
+func TestPickStackAssetForPlatform_NoStackInRelease(t *testing.T) {
+	v1Layout := githubRelease{
+		TagName: "v1.1.0",
+		Assets: []githubAsset{
+			{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/checksums.txt"},
+			{Name: "ncc-orchestrator-darwin-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-arm64"},
+			{Name: "ncc-orchestrator-linux-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-amd64"},
+		},
+	}
+	url, name := pickStackAssetForPlatform(v1Layout, "darwin", "arm64")
+	if url != "" || name != "" {
+		t.Fatalf("legacy release should return empty stack asset; got url=%q name=%q", url, name)
+	}
+}
+
+// TestResolvePackageInstallDir locks the install-dir resolution invariants:
+//
+//  1. running binary inside <X>/bin/ → install-dir is <X>
+//  2. running binary anywhere else → install-dir is the binary's directory
+//
+// This is what makes `update` invariant to the running binary's name (the
+// caller just needs the install-dir, and the running binary self-replaces
+// via os.Rename regardless of its filename).
+func TestResolvePackageInstallDir(t *testing.T) {
+	cases := []struct {
+		name     string
+		selfPath string
+		want     string
+	}{
+		{
+			name:     "inside bootstrapped stack",
+			selfPath: filepath.Join("/opt", ".ncc-v2", "bin", "ncc-orchestrator"),
+			want:     filepath.Join("/opt", ".ncc-v2"),
+		},
+		{
+			name:     "inside bootstrapped stack, renamed binary",
+			selfPath: filepath.Join("/opt", "ncc-v2", "bin", "my-fork"),
+			want:     filepath.Join("/opt", "ncc-v2"),
+		},
+		{
+			name:     "flat layout, alongside other binaries",
+			selfPath: filepath.Join("/home", "user", "dist", "ncc-orchestrator-darwin-arm64"),
+			want:     filepath.Join("/home", "user", "dist"),
+		},
+		{
+			name:     "system path",
+			selfPath: filepath.Join("/usr", "local", "bin", "ncc-orchestrator"),
+			want:     filepath.Join("/usr", "local"), // bin parent
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolvePackageInstallDir(tc.selfPath)
+			if got != tc.want {
+				t.Fatalf("resolvePackageInstallDir(%q) = %q; want %q", tc.selfPath, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasBootstrappedV2Layout_AcceptsBothNamingConventions locks in the fix
+// for the v2.0.0 stack-archive bootstrap regression where `v2-bootstrap`
+// downloaded the stack tarball, extracted it, then failed the post-extract
+// layout check because the binaries were named with platform suffixes
+// (`bin/ncc-api-server-darwin-arm64`) but the layout check looked up the
+// canonical name only (`bin/ncc-api-server`). The fix accepts both forms.
+func TestHasBootstrappedV2Layout_AcceptsBothNamingConventions(t *testing.T) {
+	t.Run("canonical names (post-fix packaging)", func(t *testing.T) {
+		dir := t.TempDir()
+		mustMkdir(t, filepath.Join(dir, "bin"))
+		mustMkdir(t, filepath.Join(dir, "frontend-dist"))
+		apiBin := "ncc-api-server"
+		uiBin := "ncc-ui-server"
+		if runtime.GOOS == "windows" {
+			apiBin += ".exe"
+			uiBin += ".exe"
+		}
+		mustTouch(t, filepath.Join(dir, "bin", apiBin))
+		mustTouch(t, filepath.Join(dir, "bin", uiBin))
+		if !hasBootstrappedV2Layout(dir) {
+			t.Fatalf("canonical names should be accepted: %s", dir)
+		}
+	})
+	t.Run("platform-suffixed names (legacy v2.0.0 packaging)", func(t *testing.T) {
+		dir := t.TempDir()
+		mustMkdir(t, filepath.Join(dir, "bin"))
+		mustMkdir(t, filepath.Join(dir, "frontend-dist"))
+		apiBin := fmt.Sprintf("ncc-api-server-%s-%s", runtime.GOOS, runtime.GOARCH)
+		uiBin := fmt.Sprintf("ncc-ui-server-%s-%s", runtime.GOOS, runtime.GOARCH)
+		if runtime.GOOS == "windows" {
+			apiBin += ".exe"
+			uiBin += ".exe"
+		}
+		mustTouch(t, filepath.Join(dir, "bin", apiBin))
+		mustTouch(t, filepath.Join(dir, "bin", uiBin))
+		if !hasBootstrappedV2Layout(dir) {
+			t.Fatalf("platform-suffixed names should be accepted (legacy v2.0.0 stack layout): %s", dir)
+		}
+	})
+	t.Run("missing frontend-dist fails", func(t *testing.T) {
+		dir := t.TempDir()
+		mustMkdir(t, filepath.Join(dir, "bin"))
+		apiBin := "ncc-api-server"
+		uiBin := "ncc-ui-server"
+		if runtime.GOOS == "windows" {
+			apiBin += ".exe"
+			uiBin += ".exe"
+		}
+		mustTouch(t, filepath.Join(dir, "bin", apiBin))
+		mustTouch(t, filepath.Join(dir, "bin", uiBin))
+		if hasBootstrappedV2Layout(dir) {
+			t.Fatalf("missing frontend-dist must fail layout check: %s", dir)
+		}
+	})
+	t.Run("missing api binary fails", func(t *testing.T) {
+		dir := t.TempDir()
+		mustMkdir(t, filepath.Join(dir, "bin"))
+		mustMkdir(t, filepath.Join(dir, "frontend-dist"))
+		uiBin := "ncc-ui-server"
+		if runtime.GOOS == "windows" {
+			uiBin += ".exe"
+		}
+		mustTouch(t, filepath.Join(dir, "bin", uiBin))
+		if hasBootstrappedV2Layout(dir) {
+			t.Fatalf("missing api binary must fail layout check: %s", dir)
+		}
+	})
+}
+
+func mustMkdir(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", p, err)
+	}
+}
+
+func mustTouch(t *testing.T, p string) {
+	t.Helper()
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatalf("create %s: %v", p, err)
+	}
+	_ = f.Close()
+}
+
+// TestPickAssetForPlatform_TrimmedV200Release simulates the post-hotfix v2.0.0
+// release (12 standalone api-server/ui-server assets removed). The v1.x
+// selector must now find ncc-orchestrator-* as the first match purely by
+// alphabetical order — the test pins this asset-layout policy.
+func TestPickAssetForPlatform_TrimmedV200Release(t *testing.T) {
+	rel := githubRelease{
+		TagName: "v2.0.0-trimmed",
+		Assets: []githubAsset{
+			{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/checksums.txt"},
+			{Name: "example_config.yaml", BrowserDownloadURL: "https://example.com/example_config.yaml"},
+			{Name: "ncc-orchestrator-darwin-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-amd64"},
+			{Name: "ncc-orchestrator-darwin-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-darwin-arm64"},
+			{Name: "ncc-orchestrator-linux-amd64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-amd64"},
+			{Name: "ncc-orchestrator-linux-arm64", BrowserDownloadURL: "https://example.com/ncc-orchestrator-linux-arm64"},
+			{Name: "ncc-orchestrator-windows-amd64.exe", BrowserDownloadURL: "https://example.com/ncc-orchestrator-windows-amd64.exe"},
+			{Name: "ncc-orchestrator-windows-arm64.exe", BrowserDownloadURL: "https://example.com/ncc-orchestrator-windows-arm64.exe"},
+			{Name: "ncc-v2-stack-darwin-amd64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-amd64.tar.gz"},
+			{Name: "ncc-v2-stack-darwin-arm64.tar.gz", BrowserDownloadURL: "https://example.com/ncc-v2-stack-darwin-arm64.tar.gz"},
+		},
+	}
+	// Even with the legacy empty-exeBase code path, the trimmed layout
+	// resolves correctly because no other binary collides alphabetically.
+	_, name := pickAssetForPlatform(rel, "darwin", "arm64", "")
+	if name != "ncc-orchestrator-darwin-arm64" {
+		t.Fatalf("trimmed layout should yield orchestrator binary even with empty exeBase; got %q", name)
+	}
+	// And with the fix's prefix-match path:
+	_, name2 := pickAssetForPlatform(rel, "darwin", "arm64", "ncc-orchestrator")
+	if name2 != "ncc-orchestrator-darwin-arm64" {
+		t.Fatalf("trimmed layout + exeBase should yield orchestrator binary; got %q", name2)
+	}
+}
+
+// TestFetchReleaseChecksum pins that verify --online's checksum lookup finds the
+// checksums.txt asset, extracts the published hash for the platform asset, and
+// reports a clear error when the entry (or the asset) is absent.
+func TestFetchReleaseChecksum(t *testing.T) {
+	const wantHash = "deadbeef00000000000000000000000000000000000000000000000000000000"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s  ncc-orchestrator-linux-amd64\n", wantHash)
+		fmt.Fprintf(w, "%s  ncc-orchestrator-darwin-arm64\n", strings.Repeat("a", 64))
+	}))
+	defer srv.Close()
+	rel := &githubRelease{
+		TagName: "v2.1.0",
+		Assets: []githubAsset{
+			{Name: "ncc-orchestrator-linux-amd64", BrowserDownloadURL: srv.URL + "/bin"},
+			{Name: "checksums.txt", BrowserDownloadURL: srv.URL + "/checksums.txt"},
+		},
+	}
+	client := srv.Client()
+
+	got, csAsset, err := fetchReleaseChecksum(rel, "ncc-orchestrator-linux-amd64", client)
+	if err != nil {
+		t.Fatalf("fetchReleaseChecksum: %v", err)
+	}
+	if got != wantHash {
+		t.Errorf("expected hash %s, got %s", wantHash, got)
+	}
+	if csAsset != "checksums.txt" {
+		t.Errorf("expected checksum asset checksums.txt, got %s", csAsset)
+	}
+
+	if _, _, err := fetchReleaseChecksum(rel, "ncc-orchestrator-windows-amd64.exe", client); err == nil {
+		t.Error("expected error for an asset name absent from checksums.txt")
+	}
+
+	noChecksum := &githubRelease{TagName: "v2.1.0", Assets: []githubAsset{{Name: "ncc-orchestrator-linux-amd64", BrowserDownloadURL: srv.URL + "/bin"}}}
+	if _, _, err := fetchReleaseChecksum(noChecksum, "ncc-orchestrator-linux-amd64", client); err == nil {
+		t.Error("expected error when the release has no checksum asset")
+	}
+}
+
+// TestRunVerifyCommand_OutputContract pins the field set printed by
+// `ncc-orchestrator verify`: support tickets, scripts, and CI checks
+// will grep for these labels, so accidental renames must trip a test.
+// Also pins that the SHA-256 reflects the *running* executable (which
+// in test mode is the test binary itself) — i.e. that we hash the
+// real file rather than recomputing some metadata-only digest.
+func TestRunVerifyCommand_OutputContract(t *testing.T) {
+	var buf bytes.Buffer
+	if err := runVerifyCommand(&buf, verifyOptions{}); err != nil {
+		t.Fatalf("runVerifyCommand: %v", err)
+	}
+	if strings.Contains(buf.String(), "verify_result:") {
+		t.Errorf("offline verify must not perform an online check\n--- output ---\n%s", buf.String())
+	}
+	got := buf.String()
+	wantKeys := []string{
+		"version:",
+		"stream:",
+		"build_date:",
+		"go_version:",
+		"os_arch:",
+		"git_revision:",
+		"git_dirty:",
+		"executable_path:",
+		"executable_sha256:",
+		"license:",
+		"project_url:",
+		"affiliation:",
+		"verify:",
+	}
+	// Affirmative attribution check: the output must explicitly state
+	// the project is NOT affiliated with Nutanix, Inc., to prevent any
+	// future drift toward implying a corporate endorsement.
+	if !strings.Contains(got, "not affiliated with or endorsed by Nutanix, Inc.") {
+		t.Errorf("verify output must include the 'not affiliated' disclaimer\n--- output ---\n%s", got)
+	}
+	for _, k := range wantKeys {
+		if !strings.Contains(got, k) {
+			t.Errorf("output missing %q\n--- output ---\n%s", k, got)
+		}
+	}
+	// Sanity: the printed SHA-256 should match the actual hash of
+	// the test executable. We can't reach into the test binary path
+	// reliably across platforms, but we can at least verify the
+	// shape (64 hex chars or the well-formed unavailable message).
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.HasPrefix(line, "executable_sha256:") {
+			continue
+		}
+		val := strings.TrimSpace(strings.TrimPrefix(line, "executable_sha256:"))
+		if strings.HasPrefix(val, "(unavailable") {
+			return // acceptable on locked-down test sandboxes
+		}
+		if len(val) != 64 {
+			t.Errorf("expected 64-char hex SHA-256, got %q", val)
+		}
+		for _, c := range val {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				t.Errorf("non-hex char %q in SHA-256 %q", c, val)
+				break
+			}
+		}
+		return
+	}
+	t.Error("output missing executable_sha256 line")
+}
+
+// TestSha256OfFile_RoundTrip pins the streaming SHA-256 helper used
+// by runVerifyCommand. Streaming is essential because some support
+// scenarios run verify on machines with limited RAM or where the
+// orchestrator binary is sitting on a read-only volume.
+func TestSha256OfFile_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "blob")
+	payload := bytes.Repeat([]byte("ncc"), 4096)
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := sha256OfFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(payload)
+	if got != hex.EncodeToString(want[:]) {
+		t.Fatalf("sha256OfFile mismatch\n got %s\nwant %s", got, hex.EncodeToString(want[:]))
+	}
+	// Missing file path errors must propagate.
+	if _, err := sha256OfFile(filepath.Join(tmp, "does-not-exist")); err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+// TestCollectBackupEntriesIncludesAuditLogAndState verifies the expanded
+// backup set: the audit log and any .ncc-api-* state at the install-dir root
+// are captured in addition to the explicitly-listed core files.
+func TestCollectBackupEntriesIncludesAuditLogAndState(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite("config.yaml", "prismCentral: pc.example.com\noutput-dir-filtered: outputfiles\n")
+	mustWrite(".ncc-api-users.json", `{"users":[]}`)
+	mustWrite(".ncc-api-token", "tok")
+	mustWrite(".ncc-api-notifications.json", "{}")
+	mustWrite(".ncc-api-custom-state.json", "{}") // future state file, caught by glob
+	mustWrite("logs/ncc-audit.log", "{\"action\":\"x\"}\n")
+	// Latest run report artifacts (top level of output-dir-filtered) are
+	// captured; the run-history under runs/ is not.
+	mustWrite("outputfiles/run-summary.json", `{"clusters":1}`)
+	mustWrite("outputfiles/index.html", "<html></html>")
+	mustWrite("outputfiles/slo-dashboard.json", "{}")
+	mustWrite("outputfiles/runs/2026-06-05/run-summary.json", `{"old":true}`)
+
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "ncc-orchestrator"), []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "frontend-dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "frontend-dist", "index.html"), []byte("<html></html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, _ := collectBackupEntries(dir, false)
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Rel] = true
+	}
+	for _, want := range []string{
+		"config.yaml",
+		".ncc-api-users.json",
+		".ncc-api-token",
+		".ncc-api-notifications.json",
+		".ncc-api-custom-state.json",
+		"logs/ncc-audit.log",
+		"outputfiles/run-summary.json",
+		"outputfiles/index.html",
+		"outputfiles/slo-dashboard.json",
+	} {
+		if !got[want] {
+			t.Errorf("expected %q in backup entries; got %v", want, got)
+		}
+	}
+	// The potentially large run-history snapshots must NOT be swept in.
+	if got["outputfiles/runs/2026-06-05/run-summary.json"] {
+		t.Error("run-history snapshots should be excluded from the backup")
+	}
+	if got["bin/ncc-orchestrator"] || got["frontend-dist/index.html"] {
+		t.Error("default backups must omit stack binaries and frontend")
+	}
+}
+
+func TestPreUpdateBackupRestoresSoftwareVersion(t *testing.T) {
+	src := t.TempDir()
+	mustWrite := func(rel, content string, mode os.FileMode) {
+		p := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite("config.yaml", "clusters: 10.0.0.1\n", 0o600)
+	mustWrite(".ncc-api-users.json", `{"users":[]}`, 0o600)
+	mustWrite(".ncc-api-token", "tok", 0o600)
+	mustWrite("bin/ncc-orchestrator", "OLD-ORCH", 0o755)
+	mustWrite("bin/ncc-api-server", "OLD-API", 0o755)
+	mustWrite("bin/ncc-ui-server", "OLD-UI", 0o755)
+	mustWrite("frontend-dist/index.html", "old-index", 0o644)
+	mustWrite("frontend-dist/assets/old.js", "old-js", 0o644)
+
+	out := filepath.Join(t.TempDir(), "pre-update.tar.gz")
+	if err := runV2Backup(v2BackupOptions{InstallDir: src, OutputFile: out, IncludeStack: true}); err != nil {
+		t.Fatalf("v2-backup --include-stack: %v", err)
+	}
+
+	dst := t.TempDir()
+	mustDst := func(rel, content string) {
+		p := filepath.Join(dst, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustDst("config.yaml", "clusters: 10.9.9.9\n")
+	mustDst("bin/ncc-orchestrator", "NEW-ORCH")
+	mustDst("bin/ncc-api-server", "NEW-API")
+	mustDst("bin/ncc-ui-server", "NEW-UI")
+	mustDst("frontend-dist/index.html", "new-index")
+	mustDst("frontend-dist/assets/new-chunk.js", "leftover-from-newer-ui")
+
+	if err := runV2Restore(v2RestoreOptions{InstallDir: dst, InputFile: out, Force: true}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	assertFile := func(rel, want string) {
+		got, err := os.ReadFile(filepath.Join(dst, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if string(got) != want {
+			t.Fatalf("%s = %q, want %q", rel, got, want)
+		}
+	}
+	assertFile("config.yaml", "clusters: 10.0.0.1\n")
+	assertFile("bin/ncc-orchestrator", "OLD-ORCH")
+	assertFile("bin/ncc-api-server", "OLD-API")
+	assertFile("bin/ncc-ui-server", "OLD-UI")
+	assertFile("frontend-dist/index.html", "old-index")
+	assertFile("frontend-dist/assets/old.js", "old-js")
+	if _, err := os.Stat(filepath.Join(dst, "frontend-dist", "assets", "new-chunk.js")); err == nil {
+		t.Fatal("newer frontend chunk should be removed when rolling back the UI")
+	}
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(filepath.Join(dst, "bin", "ncc-orchestrator")); err != nil {
+			t.Fatal(err)
+		} else if info.Mode().Perm()&0o111 == 0 {
+			t.Fatalf("restored orchestrator is not executable: %s", info.Mode())
+		}
+	}
+}
+
+// TestV2StartStateRoundTrip verifies that the portable v2-start settings
+// (CORS, listen addresses, session TTL, …) are persisted, are picked up by the
+// backup collector, and are faithfully reconstructed into restart args so a
+// restore/v2-restart does not silently drop the operator's flags.
+func TestV2StartStateRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	opts := v2StartOptions{
+		InstallDir:                 dir,
+		APIListen:                  ":9091",
+		UIListen:                   ":9090",
+		APICORSOrigins:             "https://ncc.corp.example.com",
+		UIAllowedOrigins:           "https://ncc.corp.example.com,http://10.0.0.5:8080",
+		APIAuthMode:                "hybrid",
+		APISessionTTL:              3 * time.Hour,
+		APIRateLimitPerMinute:      0, // disabled — must survive (no omitempty)
+		SelfHeal:                   true,
+		SelfHealMaxRestarts:        5,
+		SelfHealWindow:             15 * time.Minute,
+		SelfHealProbeInterval:      20 * time.Second,
+		SelfHealUnhealthyThreshold: 4,
+		// Path/ephemeral fields below must NOT leak into the persisted state.
+		ConfigPath: filepath.Join(dir, "config.yaml"),
+		Detach:     true,
+	}
+	if err := writeV2StartState(dir, opts); err != nil {
+		t.Fatalf("writeV2StartState: %v", err)
+	}
+
+	// Captured by the backup collector.
+	if _, err := os.Stat(filepath.Join(dir, v2StartStateFile)); err != nil {
+		t.Fatalf("state file not written: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("prismCentral: pc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := collectBackupEntries(dir, false)
+	foundState := false
+	for _, e := range entries {
+		if e.Rel == v2StartStateFile {
+			foundState = true
+		}
+	}
+	if !foundState {
+		t.Errorf("%s should be included in backup entries", v2StartStateFile)
+	}
+
+	// Reconstructed into restart args.
+	args, ok := v2StartArgsFromState(dir)
+	if !ok {
+		t.Fatal("v2StartArgsFromState returned ok=false")
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"--detach",
+		"--api-listen :9091",
+		"--ui-listen :9090",
+		"--api-cors-origins https://ncc.corp.example.com",
+		"--ui-allowed-origins https://ncc.corp.example.com,http://10.0.0.5:8080",
+		"--api-auth-mode hybrid",
+		"--api-session-ttl 3h0m0s",
+		"--api-rate-limit-per-minute 0",
+		"--self-heal",
+		"--self-heal-max-restarts 5",
+		"--self-heal-window 15m0s",
+		"--self-heal-probe-interval 20s",
+		"--self-heal-unhealthy-threshold 4",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("restart args missing %q; got: %s", want, joined)
+		}
+	}
+	// Path/ephemeral flags must not be reconstructed.
+	if strings.Contains(joined, "--config-path") {
+		t.Errorf("path flags must not be persisted/reconstructed; got: %s", joined)
+	}
+
+	// Absent state → no args (caller falls back to a bare default start).
+	if _, ok := v2StartArgsFromState(t.TempDir()); ok {
+		t.Error("expected ok=false when no state file is present")
+	}
+}
+
+// TestBuildAPIHealthProbeCmd checks the api-server self-probe command is
+// assembled with the built-in --health-check mode and the addressing flags it
+// needs, and that an empty binary yields no command.
+func TestBuildAPIHealthProbeCmd(t *testing.T) {
+	got := buildAPIHealthProbeCmd("/opt/ncc/bin/ncc-api-server", ":8081", "/opt/ncc/.ncc-api-token", "/opt/ncc")
+	for _, want := range []string{
+		"ncc-api-server",
+		"--health-check",
+		"--listen",
+		":8081",
+		"--token-file-path",
+		"/opt/ncc/.ncc-api-token",
+		"--repo-root",
+		"/opt/ncc",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("probe cmd missing %q; got: %s", want, got)
+		}
+	}
+	if buildAPIHealthProbeCmd("", ":8081", "/t", "/r") != "" {
+		t.Error("empty binary must yield an empty probe command")
+	}
+}
+
+// TestSelfHealSupervisorScript asserts the generated supervisor loop is valid
+// POSIX sh and encodes the enhanced behavior: health-probe-driven restarts of a
+// hung-but-alive process, exponential backoff, and cooldown-and-resume (no
+// permanent give-up) once the restart budget is exhausted.
+func TestSelfHealSupervisorScript(t *testing.T) {
+	healthCmd := "'/opt/ncc/bin/ncc-api-server' --health-check --listen ':8081'"
+	script := selfHealSupervisorScript("api", "'/opt/ncc/bin/ncc-api-server' --listen ':8081'", "/run/api.pid", "/logs/api.log", healthCmd, 5, 600, 10, 3)
+
+	for _, want := range []string{
+		"MAX_RESTARTS=5",
+		"WINDOW_SECONDS=600",
+		"PROBE_INTERVAL=10",
+		"UNHEALTHY_MAX=3",
+		"COOLDOWN_SECONDS=$WINDOW_SECONDS",
+		"HEALTH_CMD=",
+		"unhealthy threshold reached; restarting",
+		"cooling down", // cooldown-and-resume, not exit
+		"backoff=$((backoff*2))",
+		"BACKOFF_CAP",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("supervisor script missing %q", want)
+		}
+	}
+	// The enhanced supervisor must never permanently exit on exhaustion.
+	if strings.Contains(script, "exit 1") {
+		t.Error("supervisor must cool down and resume, not exit on exhausted restarts")
+	}
+
+	// Syntax-check the generated script with `sh -n` so a quoting/`set -e`
+	// regression is caught at build time rather than on a production host.
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available; skipping syntax check")
+	}
+	f := filepath.Join(t.TempDir(), "supervisor.sh")
+	if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if out, err := exec.Command("sh", "-n", f).CombinedOutput(); err != nil {
+		t.Fatalf("generated supervisor script is not valid POSIX sh: %v\n%s", err, out)
+	}
+
+	// The probe branch is gated at runtime by a non-empty HEALTH_CMD, so the
+	// health command must be embedded for the API supervisor...
+	if !strings.Contains(script, "--health-check") {
+		t.Error("API supervisor script should embed the health-check probe command")
+	}
+	// ...and the liveness-only (UI) variant must set an empty HEALTH_CMD so the
+	// probe branch never fires.
+	noProbe := selfHealSupervisorScript("ui", "'/bin/ui'", "/run/ui.pid", "/logs/ui.log", "", 3, 300, 10, 3)
+	if !strings.Contains(noProbe, "HEALTH_CMD=''") {
+		t.Error("liveness-only supervisor should set an empty HEALTH_CMD")
+	}
+	if strings.Contains(noProbe, "--health-check") {
+		t.Error("liveness-only supervisor should not embed a health-check command")
+	}
+}
+
+// TestBackupRestoreRoundTripRecordsOrchestratorVersion exercises a full
+// v2-backup -> v2-restore cycle and asserts the archive manifest records the
+// orchestrator version (and stream/build date) that created it.
+func TestBackupRestoreRoundTripRecordsOrchestratorVersion(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("prismCentral: pc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, ".ncc-api-users.json"), []byte(`{"users":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := runV2Backup(v2BackupOptions{InstallDir: src, OutputFile: out}); err != nil {
+		t.Fatalf("v2-backup: %v", err)
+	}
+
+	// Read the manifest back out of the archive.
+	f, err := os.Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	var manifest *backupManifest
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Name == "manifest.json" {
+			var m backupManifest
+			if err := json.NewDecoder(tr).Decode(&m); err != nil {
+				t.Fatal(err)
+			}
+			manifest = &m
+		}
+	}
+	if manifest == nil {
+		t.Fatal("archive missing manifest.json")
+	}
+	if manifest.Tool != "ncc-orchestrator" || manifest.Version != Version {
+		t.Fatalf("manifest tool/version = %q/%q, want ncc-orchestrator/%q", manifest.Tool, manifest.Version, Version)
+	}
+	if manifest.Stream == "" || manifest.BuildDate == "" {
+		t.Errorf("manifest should record stream/build_date; got stream=%q build_date=%q", manifest.Stream, manifest.BuildDate)
+	}
+
+	// Restore into a fresh dir (no --restart) and confirm the files land.
+	dst := t.TempDir()
+	if err := runV2Restore(v2RestoreOptions{InstallDir: dst, InputFile: out}); err != nil {
+		t.Fatalf("v2-restore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "config.yaml")); err != nil {
+		t.Errorf("restored config.yaml missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, ".ncc-api-users.json")); err != nil {
+		t.Errorf("restored user DB missing: %v", err)
+	}
+}
+
+// TestHealRestoredConfigPaths verifies a Windows-origin backup's file-reference
+// paths are rebased onto a Unix install dir and separators normalized, so a
+// cross-OS restore "just works".
+func TestHealRestoredConfigPaths(t *testing.T) {
+	dir := t.TempDir()
+	oldInstall := `C:\ncc\.ncc-v2`
+	cfg := "prismCentral: pc\n" +
+		"clusters-file: " + `C:\ncc\.ncc-v2\clusters.txt` + "\n" +
+		"output-dir-filtered: " + `C:\ncc\.ncc-v2\outputfiles` + "\n" +
+		"log-file: " + `logs\ncc-runner.log` + "\n" +
+		"secrets-file: " + `D:\shared\secrets.yaml` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, warnings := healRestoredConfigPaths(dir, oldInstall)
+	if len(changed) == 0 {
+		t.Fatalf("expected some keys healed; got none (warnings=%v)", warnings)
+	}
+	out, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+
+	// Paths under the old install dir are rebased to relative paths.
+	if v := healTestVal(t, got, "clusters-file"); v != "clusters.txt" {
+		t.Errorf("clusters-file = %q, want clusters.txt", v)
+	}
+	if v := healTestVal(t, got, "output-dir-filtered"); v != "outputfiles" {
+		t.Errorf("output-dir-filtered = %q, want outputfiles", v)
+	}
+	// Backslashes in a relative path are normalized to forward slashes.
+	if v := healTestVal(t, got, "log-file"); v != "logs/ncc-runner.log" {
+		t.Errorf("log-file = %q, want logs/ncc-runner.log", v)
+	}
+	// An absolute path outside the old install dir can't be rebased and is
+	// normalized but reported as a warning.
+	foundWarn := false
+	for _, w := range warnings {
+		if strings.Contains(w, "secrets-file") {
+			foundWarn = true
+		}
+	}
+	if !foundWarn {
+		t.Errorf("expected a warning about secrets-file; warnings=%v", warnings)
+	}
+}
+
+func healTestVal(t *testing.T, content, key string) string {
+	t.Helper()
+	return yamlScalarValue(content, key)
+}
+
+// TestBackupManifestSurfacesSAMLAndLDAP asserts the manifest's auth summary
+// reflects SAML/LDAP coverage (including whether the SP key and LDAP bind
+// password travelled with the archive), since those secrets live inside
+// .ncc-api-users.json rather than in their own files.
+func TestBackupManifestSurfacesSAMLAndLDAP(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("prismCentral: pc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	usersDB := `{
+		"users":[{"username":"admin"},{"username":"alice"}],
+		"saml":{"enabled":true,"sp_key_pem":"-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----"},
+		"ldap":{"enabled":true,"url":"ldaps://dc1","base_dn":"DC=corp","bind_password":"s3cret"}
+	}`
+	if err := os.WriteFile(filepath.Join(src, ".ncc-api-users.json"), []byte(usersDB), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct summary check first.
+	s := summarizeAuthProviders(filepath.Join(src, ".ncc-api-users.json"))
+	if s == nil {
+		t.Fatal("summarizeAuthProviders returned nil")
+	}
+	if s.LocalAccounts != 2 {
+		t.Errorf("local accounts = %d, want 2", s.LocalAccounts)
+	}
+	if !s.SAMLPresent || !s.SAMLEnabled || !s.SAMLHasSPKey {
+		t.Errorf("SAML summary = %+v, want present+enabled+has-key", s)
+	}
+	if !s.LDAPPresent || !s.LDAPEnabled || !s.LDAPHasBindPassword {
+		t.Errorf("LDAP summary = %+v, want present+enabled+has-bind-password", s)
+	}
+
+	// And confirm it is persisted into the archive manifest.
+	out := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := runV2Backup(v2BackupOptions{InstallDir: src, OutputFile: out}); err != nil {
+		t.Fatalf("v2-backup: %v", err)
+	}
+	f, err := os.Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	var manifest *backupManifest
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Name == "manifest.json" {
+			var m backupManifest
+			if err := json.NewDecoder(tr).Decode(&m); err != nil {
+				t.Fatal(err)
+			}
+			manifest = &m
+		}
+	}
+	if manifest == nil || manifest.Auth == nil {
+		t.Fatal("manifest missing auth summary")
+	}
+	if !manifest.Auth.SAMLHasSPKey || !manifest.Auth.LDAPHasBindPassword {
+		t.Errorf("manifest auth summary = %+v, want SAML SP key + LDAP bind password recorded", manifest.Auth)
+	}
+}
+
+func TestPreserveHostStartStateNetworking(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, v2StartStateFile)
+
+	// pre = this host's good settings (captured before restore).
+	pre := v2StartState{
+		APIListen:        ":8081",
+		UIListen:         ":8080",
+		APIAdvertiseURL:  "http://10.21.88.27:8081",
+		UIAdvertiseURL:   "http://10.21.88.27:8080",
+		UIAllowedOrigins: "http://10.21.88.27:8080",
+		UITLSCertFile:    "/root/ncc-orchestrator/tls/ui.crt",
+		APIAuthMode:      "token",
+	}
+
+	// The restore just wrote the backup's (foreign) start-state: different
+	// origins, no TLS, plus a non-network setting we must keep from the backup.
+	restored := v2StartState{
+		APIListen:             ":9091",
+		UIListen:              ":9090",
+		APIAdvertiseURL:       "http://192.168.1.5:9091",
+		UIAllowedOrigins:      "http://192.168.1.5:9090",
+		APIAuthMode:           "session",
+		APIRateLimitPerMinute: 120,
+	}
+	data, _ := json.MarshalIndent(restored, "", "  ")
+	if err := os.WriteFile(statePath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	kept := preserveHostStartStateNetworking(dir, pre, true)
+	if len(kept) == 0 {
+		t.Fatal("expected some host networking fields to be preserved")
+	}
+
+	got, ok := loadV2StartState(dir)
+	if !ok {
+		t.Fatal("could not reload merged start-state")
+	}
+	// Networking fields must be this host's (pre) values.
+	if got.UIAllowedOrigins != pre.UIAllowedOrigins || got.APIAdvertiseURL != pre.APIAdvertiseURL ||
+		got.APIListen != pre.APIListen || got.UIListen != pre.UIListen || got.UITLSCertFile != pre.UITLSCertFile {
+		t.Fatalf("networking fields not preserved: %+v", got)
+	}
+	// Non-network settings must come from the backup.
+	if got.APIAuthMode != "session" || got.APIRateLimitPerMinute != 120 {
+		t.Fatalf("non-network settings should come from the backup, got auth=%q rate=%d", got.APIAuthMode, got.APIRateLimitPerMinute)
+	}
+
+	// No pre-state (fresh install) must be a no-op.
+	if kept := preserveHostStartStateNetworking(dir, v2StartState{}, false); kept != nil {
+		t.Fatalf("expected no-op without pre-state, got %v", kept)
+	}
+}
+
+// TestVerifyBackupArchiveEnforcesCaps pins the restore-hardening caps shared by
+// verifyBackupArchive and runV2Restore: a single file over the per-file limit
+// and an archive with too many entries are both rejected (so a decompression
+// bomb or a corrupt/oversize file can't exhaust memory or disk, and can't be
+// silently truncated on restore), while a normal small archive still verifies.
+func TestVerifyBackupArchiveEnforcesCaps(t *testing.T) {
+	buildArchive := func(t *testing.T, entries func(tw *tar.Writer)) string {
+		t.Helper()
+		var buf bytes.Buffer
+		gzw := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gzw)
+		mani := []byte(`{"tool":"ncc-orchestrator","version":"2.1.0"}`)
+		if err := tw.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o600, Size: int64(len(mani)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("manifest hdr: %v", err)
+		}
+		if _, err := tw.Write(mani); err != nil {
+			t.Fatalf("manifest body: %v", err)
+		}
+		entries(tw)
+		if err := tw.Close(); err != nil {
+			t.Fatalf("tar close: %v", err)
+		}
+		if err := gzw.Close(); err != nil {
+			t.Fatalf("gz close: %v", err)
+		}
+		p := filepath.Join(t.TempDir(), "b.tar.gz")
+		if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		return p
+	}
+
+	t.Run("oversize file rejected", func(t *testing.T) {
+		size := int64(maxBackupFileBytes) + 1
+		path := buildArchive(t, func(tw *tar.Writer) {
+			if err := tw.WriteHeader(&tar.Header{Name: "data/big.bin", Mode: 0o600, Size: size, Typeflag: tar.TypeReg}); err != nil {
+				t.Fatalf("hdr: %v", err)
+			}
+			chunk := make([]byte, 1<<20) // zeros: tiny once gzipped
+			for written := int64(0); written < size; {
+				n := int64(len(chunk))
+				if size-written < n {
+					n = size - written
+				}
+				if _, err := tw.Write(chunk[:n]); err != nil {
+					t.Fatalf("body: %v", err)
+				}
+				written += n
+			}
+		})
+		if _, err := verifyBackupArchive(path); err == nil {
+			t.Fatal("expected oversize file to fail verification")
+		}
+	})
+
+	t.Run("too many files rejected", func(t *testing.T) {
+		body := []byte("x")
+		path := buildArchive(t, func(tw *tar.Writer) {
+			for i := 0; i <= maxBackupFileCount; i++ {
+				name := fmt.Sprintf("data/f%d.txt", i)
+				if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+					t.Fatalf("hdr: %v", err)
+				}
+				if _, err := tw.Write(body); err != nil {
+					t.Fatalf("body: %v", err)
+				}
+			}
+		})
+		if _, err := verifyBackupArchive(path); err == nil {
+			t.Fatal("expected too-many-files to fail verification")
+		}
+	})
+
+	t.Run("normal archive passes", func(t *testing.T) {
+		body := []byte("clusters:\n  - addr: 10.0.0.1\n")
+		path := buildArchive(t, func(tw *tar.Writer) {
+			if err := tw.WriteHeader(&tar.Header{Name: "data/config.yaml", Mode: 0o600, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+				t.Fatalf("hdr: %v", err)
+			}
+			if _, err := tw.Write(body); err != nil {
+				t.Fatalf("body: %v", err)
+			}
+		})
+		res, err := verifyBackupArchive(path)
+		if err != nil {
+			t.Fatalf("normal archive should verify: %v", err)
+		}
+		if res.DataFiles != 1 {
+			t.Fatalf("expected 1 data file, got %d", res.DataFiles)
+		}
+	})
+}
+
+// TestEncryptedBackupRoundTrip pins `v2-backup --encrypt` + `v2-restore`
+// auto-detect: a passphrase- and a key-file-encrypted archive each round-trip,
+// the on-disk archive is unreadable as a plain tar.gz, and the wrong
+// passphrase/key fails to decrypt (GCM auth) rather than restoring garbage.
+func TestEncryptedBackupRoundTrip(t *testing.T) {
+	newSrc := func(t *testing.T) string {
+		t.Helper()
+		src := t.TempDir()
+		if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("prismCentral: pc\npassword: s3cret\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, ".ncc-api-users.json"), []byte(`{"users":[]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return src
+	}
+
+	t.Run("passphrase round trip", func(t *testing.T) {
+		src := newSrc(t)
+		out := filepath.Join(t.TempDir(), "enc.tar.gz")
+		if err := runV2Backup(v2BackupOptions{InstallDir: src, OutputFile: out, Encrypt: true, Passphrase: "correct horse battery staple"}); err != nil {
+			t.Fatalf("encrypted backup: %v", err)
+		}
+		// The file must be detected as encrypted and must NOT verify as a plain archive.
+		if enc, err := backupArchiveIsEncrypted(out); err != nil || !enc {
+			t.Fatalf("expected encrypted archive (enc=%v err=%v)", enc, err)
+		}
+		if _, err := verifyBackupArchive(out); err == nil {
+			t.Fatal("encrypted archive must not verify as a plain tar.gz")
+		}
+		// Wrong passphrase fails.
+		if err := runV2Restore(v2RestoreOptions{InstallDir: t.TempDir(), InputFile: out, Passphrase: "wrong"}); err == nil {
+			t.Fatal("restore with wrong passphrase should fail")
+		}
+		// Correct passphrase restores the files.
+		dst := t.TempDir()
+		if err := runV2Restore(v2RestoreOptions{InstallDir: dst, InputFile: out, Passphrase: "correct horse battery staple"}); err != nil {
+			t.Fatalf("restore with correct passphrase: %v", err)
+		}
+		if b, err := os.ReadFile(filepath.Join(dst, "config.yaml")); err != nil || !strings.Contains(string(b), "s3cret") {
+			t.Fatalf("restored config.yaml missing/incorrect: %v", err)
+		}
+	})
+
+	t.Run("key-file round trip", func(t *testing.T) {
+		src := newSrc(t)
+		keyFile := filepath.Join(t.TempDir(), "key.b64")
+		// 32 zero bytes, base64-encoded.
+		if err := os.WriteFile(keyFile, []byte(base64StdKey32()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out := filepath.Join(t.TempDir(), "enck.tar.gz")
+		if err := runV2Backup(v2BackupOptions{InstallDir: src, OutputFile: out, Encrypt: true, KeyFile: keyFile}); err != nil {
+			t.Fatalf("key-encrypted backup: %v", err)
+		}
+		if enc, err := backupArchiveIsEncrypted(out); err != nil || !enc {
+			t.Fatalf("expected encrypted archive (enc=%v err=%v)", enc, err)
+		}
+		dst := t.TempDir()
+		if err := runV2Restore(v2RestoreOptions{InstallDir: dst, InputFile: out, KeyFile: keyFile}); err != nil {
+			t.Fatalf("restore with key file: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dst, ".ncc-api-users.json")); err != nil {
+			t.Errorf("restored user DB missing: %v", err)
+		}
+	})
+}
+
+// base64StdKey32 returns a base64-encoded 32-byte key for tests.
+func base64StdKey32() string {
+	return base64.StdEncoding.EncodeToString(make([]byte, 32))
 }

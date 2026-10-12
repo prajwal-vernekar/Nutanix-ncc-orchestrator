@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ncc-v2-config
+  namespace: ncc-orchestrator-v2
+# ui-origin must be the HTTPS URL browsers use (LoadBalancer IP or DNS name).
+# After the first apply: kubectl get svc ncc-v2-ui -n ncc-orchestrator-v2
+# then set this to https://<EXTERNAL-IP> and apply again (or patch the ConfigMap).
+data:
+  ui-origin: "https://ncc.example.com"
+  config.yaml: |
+    schema-version: 1
+    runner:
+      targets:
+        mode: clusters
+        clusters: []
+        pcs: []
+      credentials:
+        username: admin
+        password: secret://NCC_PASSWORD
+      execution:
+        timeout: 15m
+        request-timeout: 20s
+        poll-interval: 15s
+        poll-jitter: 2s
+        max-parallel: 4
+      retry:
+        max-attempts: 6
+        base-delay: 400ms
+        max-delay: 8s
+        circuit-breaker: 3
+      filtering:
+        policy-gates: ""
+        severity: []
+        exclude-alert-titles: []
+        flaky-lookback-runs: 6
+        flaky-min-transitions: 2
+    storage:
+      output-dir: /data/outputfiles
+      logs-dir: /data/nccfiles
+      run-history-dir: /data/outputfiles/runs
+      prom-dir: /data/promfiles
+    api:
+      cache:
+        pc-alerts-cache-ttl: 5m
+    notifications:
+      smtp-port: 587
+    deployment:
+      platform: kubernetes
+      self-heal: false

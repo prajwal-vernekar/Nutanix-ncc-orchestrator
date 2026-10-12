@@ -1,0 +1,40 @@
+# Optional. Not applied by `kubectl apply -k k8s/`.
+# The default path is the UI LoadBalancer (:80 HTTP redirect, :443 HTTPS).
+# Use this only when you have an Ingress controller and want a hostname.
+#
+#   kubectl apply -f k8s/ingress.yaml
+#
+# Set spec.ingressClassName to a class that exists (`kubectl get ingressclass`).
+# nginx SSL passthrough or Traefik HTTPS backend both work; the UI is the TLS
+# terminator (self-signed or BYO from Settings).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ncc-v2-ui
+  namespace: ncc-orchestrator-v2
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+    # Traefik: traefik.ingress.kubernetes.io/service.serversscheme: https
+    # Optional public cert at the Ingress (instead of passthrough to the UI cert):
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ncc.example.com
+      secretName: ncc-v2-ui-tls
+  rules:
+    - host: ncc.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ncc-v2-ui
+                port:
+                  name: https

@@ -1,26 +1,1110 @@
-# For Linux x86_64
-GOOS=linux GOARCH=amd64 go build -ldflags "-w -s \
-  -X main.Version=0.1.3_LINUX_AMD64 \
-  -X main.BuildDate=$(date -u '+%Y-%m-%dT%H:%M:%SZ') \
-  -X main.Stream=Beta \
-  -X main.GoVersion=$(go version | cut -d ' ' -f 3)" \
-  -o ncc-orchestrator-linux-amd64
+#!/usr/bin/env bash
+# Release build for ncc-orchestrator, ncc-api-server, and ncc-ui-server.
+#
+# Hosts (same script, same flags):
+#   Linux / macOS:   bash binaryGO.txt
+#   Windows:         binaryGO.cmd
+#                    or, from Git Bash: bash binaryGO.txt
+#
+# Default output is all six platform pairs:
+#   linux, darwin, windows  ×  amd64, arm64
+# Cross-compilation uses CGO_ENABLED=0, so a Linux or Windows host can
+# produce the Mac and Windows binaries too. Each file is checked for an
+# ELF, Mach-O, or PE header before the run is called successful.
+#
+# Examples:
+#   bash binaryGO.txt
+#   bash binaryGO.txt --os linux,darwin,windows --arch amd64,arm64 --jobs 8
+#   bash binaryGO.txt --bins-only --skip-tests
+#   bash binaryGO.txt --set-version 2.2.0
+#   bash binaryGO.txt --update-deps --govulncheck
+#
+# Link flags always include main.Version, main.Stream, main.GitRevision,
+# main.BuildDate, and main.GoVersion. Optional --docker packages the Linux
+# binaries after they exist; it is not required to produce release binaries.
+set -euo pipefail
 
-# For Windows x86_64
-GOOS=windows GOARCH=amd64 go build -ldflags "-w -s \
-  -X main.Version=0.1.3_WIN_AMD64 \
-  -X main.BuildDate=$(date -u '+%Y-%m-%dT%H:%M:%SZ') \
-  -X main.Stream=Beta \
-  -X main.GoVersion=$(go version | cut -d ' ' -f 3)" \
-  -o ncc-orchestrator-win-amd64.exe
+uname_s=$(uname -s 2>/dev/null || echo unknown)
+case "$uname_s" in
+  Linux*) HOST_KERNEL=linux ;;
+  Darwin*) HOST_KERNEL=darwin ;;
+  MINGW*|MSYS*|CYGWIN*) HOST_KERNEL=windows ;;
+  *)
+    if [ "${OS:-}" = "Windows_NT" ]; then
+      HOST_KERNEL=windows
+    else
+      HOST_KERNEL=unknown
+    fi
+    ;;
+esac
+# Git Bash rewrites Unix-looking arguments before they reach go.exe.
+# Leave relative dist/ paths alone so -o and -ldflags survive.
+if [ "$HOST_KERNEL" = "windows" ]; then
+  export MSYS_NO_PATHCONV=1
+  export MSYS2_ARG_CONV_EXCL='*'
+fi
 
-# For Mac ARM64
-GOOS=darwin GOARCH=arm64 go build -ldflags "-w -s \
-  -X main.Version=0.1.3_MAC_ARM \
-  -X main.BuildDate=$(date -u '+%Y-%m-%dT%H:%M:%SZ') \
-  -X main.Stream=Beta \
-  -X main.GoVersion=$(go version | cut -d ' ' -f 3)" \
-  -o ncc-orchestrator-mac-arm64
+START_EPOCH=$(date +%s)
 
+SKIP_TESTS=0
+SKIP_PREFLIGHT=0
+SKIP_FRONTEND=0
+SKIP_VERSION_CHECK=0
+SKIP_SBOM=0
+NO_STACKS=0
+BINS_ONLY=0
+IMAGES_ONLY=0
+DO_DOCKER=0
+DO_PUSH=0
+DO_LATEST=1
+UPDATE_DEPS=0
+DO_GOVULN=0
+REQUIRE_CLEAN=0
+WITH_MCP=0
+DRY_RUN=0
+PRINT_LDFLAGS=0
+SET_VERSION=""
+VERSION_ARG=""
+STREAM_ARG=""
+OS_LIST="linux,darwin,windows"
+ARCH_LIST="amd64,arm64"
+DOCKER_ARCH=""
+ENGINE_ARG=""
+JOBS=""
+REGISTRY="${NCC_DOCKER_REGISTRY:-docker.io}"
+IMAGE_PREFIX="${NCC_IMAGE_PREFIX:-prajwalnutant}"
 
-Check using: go tool dist list
+usage() {
+  cat <<'EOF'
+Usage: bash binaryGO.txt [options]
+       binaryGO.cmd [options]          (Windows cmd or PowerShell)
+
+Build linux, macOS, and Windows binaries (default), then stack archives.
+Runs on Linux, macOS, and Windows Git Bash. A Linux or Windows host can
+cross-compile the other two operating systems.
+
+Version and dependencies
+  --version VER          Override the VERSION file for this build
+  --set-version VER      Write VER into VERSION, frontend/package.json,
+                         Helm chart/tags, and k8s image tags, then build
+  --stream NAME          main.Stream ldflag (default: $STREAM or Release)
+  --check-versions       Fail if release stamps disagree (default: on)
+  --skip-version-check   Build even if stamps disagree
+  --update-deps          go get -u ./... && go mod tidy, npm update, audit
+  --govulncheck          Run govulncheck ./... before compiling
+  --require-clean        Refuse a dirty git worktree (default: append -dirty)
+
+What to build
+  --os LIST              Comma-separated: linux,darwin,windows (default: all three)
+  --arch LIST            Comma-separated: amd64,arm64 (default: both)
+  --jobs N               Parallel go builds (default: CPU count, max 8)
+  --with-mcp             Also build ncc-mcp-server (extra; not in stack zips)
+  --bins-only            Binaries and symlinks only (no archives or images)
+  --no-stacks            Skip stack archives, SBOM, attestation, checksums
+  --skip-tests           Skip go test (vet still runs)
+  --skip-preflight       Skip module verify, vet, and tests
+  --skip-frontend        Do not rebuild the SPA (reuse dist/frontend-dist)
+  --skip-sbom            Do not run cyclonedx-gomod
+  --print-ldflags        Print the -ldflags string and exit
+  --dry-run              Print the plan and exit without writing dist/
+
+Images (packages the linux binaries this script built)
+  --docker               Build runner, API, and UI images with docker or podman
+  --images-only          Images only: linux binaries for one arch, the UI, then
+                         the images. Skips other OS builds, stacks, and preflight.
+                         Combine with --push to publish.
+  --engine NAME          docker or podman (default: docker if that binary
+                         is on PATH, otherwise podman). A shell alias is ignored.
+  --push                 Push images (implies --docker)
+  --docker-arch ARCH     Linux arch inside the image (default: amd64).
+                         The tag is name:VERSION, not name:VERSION-ARCH.
+  --registry HOST        default: $NCC_DOCKER_REGISTRY or docker.io
+  --image-prefix NAME    default: $NCC_IMAGE_PREFIX or prajwalnutant
+  --no-latest            Do not tag :latest (latest is on for Stream=Release)
+
+Env: VERSION, STREAM, BUILD_DATE, GIT_REVISION, NCC_RELEASE_PUBKEY,
+     NCC_RELEASE_SIGN_KEY, NCC_MACOS_*, NCC_WINDOWS_*, NCC_LINUX_GPG_KEY_ID,
+     NCC_CONTAINER_ENGINE (docker or podman), NCC_CONTAINER_CA (extra PEM)
+EOF
+}
+
+die() {
+  echo "binaryGO.txt: $*" >&2
+  exit 2
+}
+
+in_csv() {
+  case ",$1," in
+    *",$2,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+csv_count() {
+  local IFS=,
+  set -- $1
+  echo $#
+}
+
+run_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$@"
+  elif command -v python >/dev/null 2>&1; then
+    python "$@"
+  elif command -v py >/dev/null 2>&1; then
+    py -3 "$@"
+  else
+    return 127
+  fi
+}
+
+run_npm() {
+  if command -v npm >/dev/null 2>&1; then
+    npm "$@"
+  elif command -v npm.cmd >/dev/null 2>&1 && command -v cmd.exe >/dev/null 2>&1; then
+    cmd.exe /c npm.cmd "$@"
+  else
+    echo "npm was not found on PATH" >&2
+    return 127
+  fi
+}
+
+default_jobs() {
+  local n=4
+  if [ "$HOST_KERNEL" = "windows" ] && [ -n "${NUMBER_OF_PROCESSORS:-}" ]; then
+    n=$NUMBER_OF_PROCESSORS
+  elif command -v nproc >/dev/null 2>&1; then
+    n=$(nproc)
+  elif command -v sysctl >/dev/null 2>&1; then
+    n=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+  fi
+  if [ "$n" -gt 8 ]; then n=8; fi
+  if [ "$n" -lt 1 ]; then n=1; fi
+  echo "$n"
+}
+
+sha256_file() {
+  local sum win
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+    return
+  fi
+  if command -v powershell.exe >/dev/null 2>&1; then
+    win="$1"
+    if command -v cygpath >/dev/null 2>&1; then
+      win=$(cygpath -w "$1")
+    fi
+    sum=$(powershell.exe -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '$win').Hash.ToLower()")
+    printf '%s\n' "$sum" | tr -d '\r'
+    return
+  fi
+  echo "binaryGO.txt: no sha256 tool (sha256sum, shasum, openssl, or powershell)" >&2
+  return 1
+}
+
+# First 4 bytes decide ELF / Mach-O / PE so a cross-compile that emitted the
+# wrong container fails before archives are packed.
+assert_binary_kind() {
+  local file="$1" goos="$2" mag
+  if ! command -v od >/dev/null 2>&1; then
+    return 0
+  fi
+  mag=$(od -An -t x1 -N 4 "$file" | tr -d ' \n' | tr 'A-F' 'a-f')
+  case "$goos" in
+    linux)
+      case "$mag" in
+        7f454c46*) return 0 ;;
+      esac
+      ;;
+    windows)
+      case "$mag" in
+        4d5a*) return 0 ;;
+      esac
+      ;;
+    darwin)
+      case "$mag" in
+        cffaedfe*|feedfacf*|cefaedfe*|feedface*|cafebabe*|bebafeca*) return 0 ;;
+      esac
+      ;;
+  esac
+  echo "binaryGO.txt: $file is not a $goos binary (header $mag)" >&2
+  return 1
+}
+
+link_or_copy() {
+  local src="$1" dst="$2"
+  rm -f "$dst"
+  # Symlink target is the sibling filename so the link stays valid inside dist/.
+  # Windows copies instead: creating symlinks there needs extra privileges.
+  if [ "$HOST_KERNEL" != "windows" ] && ln -sfn "$(basename "$src")" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  cp -f "$src" "$dst"
+}
+
+pack_zip() {
+  local root="$1" dest="$2"
+  shift 2
+  if command -v zip >/dev/null 2>&1; then
+    (cd "$root" && zip -qr "$dest" "$@")
+    return
+  fi
+  if run_python -c 'import zipfile' >/dev/null 2>&1; then
+    (
+      cd "$root" && run_python - "$dest" "$@" <<'PY'
+import os, sys, zipfile
+dest, items = sys.argv[1], sys.argv[2:]
+with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for item in items:
+        if os.path.isfile(item):
+            zf.write(item, item.replace("\\", "/"))
+            continue
+        for dirpath, _, files in os.walk(item):
+            for name in files:
+                full = os.path.join(dirpath, name)
+                zf.write(full, full.replace("\\", "/"))
+PY
+    )
+    return
+  fi
+  die "Windows archives need zip or python (zipfile)"
+}
+
+count_matches() {
+  local n=0 f pattern="$1"
+  shopt -s nullglob
+  for f in $pattern; do
+    case "$f" in
+      *.asc|*.sig) continue ;;
+    esac
+    if [ -f "$f" ]; then
+      n=$((n + 1))
+    fi
+  done
+  shopt -u nullglob
+  echo "$n"
+}
+
+need_arg() {
+  if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+    die "$1 needs a value"
+  fi
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --skip-test|--skip-tests) SKIP_TESTS=1 ;;
+    --skip-preflight) SKIP_PREFLIGHT=1; SKIP_TESTS=1 ;;
+    --skip-frontend) SKIP_FRONTEND=1 ;;
+    --skip-version-check) SKIP_VERSION_CHECK=1 ;;
+    --check-versions) SKIP_VERSION_CHECK=0 ;;
+    --skip-sbom) SKIP_SBOM=1 ;;
+    --no-stacks) NO_STACKS=1 ;;
+    --bins-only) BINS_ONLY=1; NO_STACKS=1 ;;
+    --docker) DO_DOCKER=1 ;;
+    --images-only) IMAGES_ONLY=1; DO_DOCKER=1; NO_STACKS=1; SKIP_PREFLIGHT=1; SKIP_TESTS=1 ;;
+    --push) DO_DOCKER=1; DO_PUSH=1 ;;
+    --engine) need_arg "$@"; ENGINE_ARG="$2"; shift ;;
+    --engine=*) ENGINE_ARG="${1#*=}" ;;
+    --no-latest) DO_LATEST=0 ;;
+    --update-deps) UPDATE_DEPS=1 ;;
+    --govulncheck) DO_GOVULN=1 ;;
+    --require-clean) REQUIRE_CLEAN=1 ;;
+    --with-mcp) WITH_MCP=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --print-ldflags) PRINT_LDFLAGS=1 ;;
+    --version) need_arg "$@"; VERSION_ARG="$2"; shift ;;
+    --version=*) VERSION_ARG="${1#*=}" ;;
+    --set-version) need_arg "$@"; SET_VERSION="$2"; shift ;;
+    --set-version=*) SET_VERSION="${1#*=}" ;;
+    --stream) need_arg "$@"; STREAM_ARG="$2"; shift ;;
+    --stream=*) STREAM_ARG="${1#*=}" ;;
+    --os) need_arg "$@"; OS_LIST="$2"; shift ;;
+    --os=*) OS_LIST="${1#*=}" ;;
+    --arch) need_arg "$@"; ARCH_LIST="$2"; shift ;;
+    --arch=*) ARCH_LIST="${1#*=}" ;;
+    --jobs) need_arg "$@"; JOBS="$2"; shift ;;
+    --jobs=*) JOBS="${1#*=}" ;;
+    --docker-arch) need_arg "$@"; DOCKER_ARCH="$2"; shift ;;
+    --docker-arch=*) DOCKER_ARCH="${1#*=}" ;;
+    --registry) need_arg "$@"; REGISTRY="$2"; shift ;;
+    --registry=*) REGISTRY="${1#*=}" ;;
+    --image-prefix) need_arg "$@"; IMAGE_PREFIX="$2"; shift ;;
+    --image-prefix=*) IMAGE_PREFIX="${1#*=}" ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+for goos in $(echo "$OS_LIST" | tr ',' ' '); do
+  case "$goos" in
+    linux|darwin|windows) ;;
+    *) die "unsupported --os value: $goos" ;;
+  esac
+done
+for goarch in $(echo "$ARCH_LIST" | tr ',' ' '); do
+  case "$goarch" in
+    amd64|arm64) ;;
+    *) die "unsupported --arch value: $goarch" ;;
+  esac
+done
+
+if [ -z "$JOBS" ]; then
+  JOBS=$(default_jobs)
+fi
+case "$JOBS" in
+  ''|*[!0-9]*) die "--jobs must be a positive integer" ;;
+esac
+if [ "$JOBS" -lt 1 ]; then
+  die "--jobs must be >= 1"
+fi
+
+if [ -n "$SET_VERSION" ]; then
+  VERSION_ARG="$SET_VERSION"
+fi
+
+if [ -n "$VERSION_ARG" ]; then
+  VERSION="$VERSION_ARG"
+else
+  VERSION="$(tr -d '[:space:]' < VERSION)"
+fi
+if [ -z "$VERSION" ]; then
+  die "VERSION is empty"
+fi
+
+if [ -n "$STREAM_ARG" ]; then
+  STREAM="$STREAM_ARG"
+else
+  STREAM="${STREAM:-Release}"
+fi
+case "$STREAM" in
+  *[!A-Za-z0-9._-]*) die "stream must be alphanumeric (got: $STREAM)" ;;
+esac
+
+if [ "$IMAGES_ONLY" = 1 ] && [ "$BINS_ONLY" = 1 ]; then
+  die "--images-only cannot be combined with --bins-only"
+fi
+if [ "$IMAGES_ONLY" = 1 ]; then
+  OS_LIST=linux
+fi
+
+if [ "$DO_DOCKER" = 1 ] && ! in_csv "$OS_LIST" linux; then
+  die "--docker needs linux binaries; include linux in --os"
+fi
+
+stamp_version() {
+  local ver="$1"
+  run_python - "$ver" <<'PY'
+import pathlib, re, sys
+ver = sys.argv[1]
+root = pathlib.Path(".")
+(root / "VERSION").write_text(ver + "\n")
+
+pkg = root / "frontend" / "package.json"
+text = pkg.read_text()
+pkg.write_text(re.sub(r'("version": ")[^"]+"', r"\g<1>" + ver + '"', text, count=1))
+
+chart = root / "helm" / "ncc-orchestrator" / "Chart.yaml"
+ct = chart.read_text()
+ct = re.sub(r'(?m)^version:\s*\S+', "version: " + ver, ct, count=1)
+ct = re.sub(r'(?m)^appVersion:\s*"[^"]+"', 'appVersion: "' + ver + '"', ct, count=1)
+chart.write_text(ct)
+
+values = root / "helm" / "ncc-orchestrator" / "values.yaml"
+vt = values.read_text()
+vt = re.sub(r'(?m)^(\s*tag:\s*")[^"]+"', r"\g<1>" + ver + '"', vt)
+values.write_text(vt)
+
+kust = root / "k8s" / "kustomization.yaml"
+kt = kust.read_text()
+kt = re.sub(r'(?m)^(\s*newTag:\s*")[^"]+"', r"\g<1>" + ver + '"', kt)
+kust.write_text(kt)
+
+img = re.compile(r'(docker\.io/prajwalnutant/(?:nutanix-ncc-orchestrator|ncc-api-server|ncc-ui-server):)[^\s"]+')
+for path in (root / "k8s").glob("*.yaml"):
+    raw = path.read_text()
+    updated = img.sub(r"\g<1>" + ver, raw)
+    if updated != raw:
+        path.write_text(updated)
+print("stamped version", ver)
+PY
+}
+
+check_versions() {
+  local failed=0 got tags
+  got=$(awk -F'"' '/"version":/{print $4; exit}' frontend/package.json)
+  if [ "$got" != "$VERSION" ]; then
+    echo "version mismatch: frontend/package.json is $got, VERSION is $VERSION" >&2
+    failed=1
+  fi
+  got=$(awk '/^version:/{print $2; exit}' helm/ncc-orchestrator/Chart.yaml)
+  if [ "$got" != "$VERSION" ]; then
+    echo "version mismatch: helm chart version is $got, VERSION is $VERSION" >&2
+    failed=1
+  fi
+  got=$(awk -F'"' '/^appVersion:/{print $2; exit}' helm/ncc-orchestrator/Chart.yaml)
+  if [ "$got" != "$VERSION" ]; then
+    echo "version mismatch: helm appVersion is $got, VERSION is $VERSION" >&2
+    failed=1
+  fi
+  tags=$(awk -F'"' '/newTag:/{print $2}' k8s/kustomization.yaml)
+  for got in $tags; do
+    if [ "$got" != "$VERSION" ]; then
+      echo "version mismatch: k8s/kustomization.yaml newTag $got, VERSION is $VERSION" >&2
+      failed=1
+    fi
+  done
+  tags=$(awk -F'"' '/^[[:space:]]*tag:/{print $2}' helm/ncc-orchestrator/values.yaml)
+  for got in $tags; do
+    if [ "$got" != "$VERSION" ]; then
+      echo "version mismatch: helm values tag $got, VERSION is $VERSION" >&2
+      failed=1
+    fi
+  done
+  local line tag
+  for line in $(grep -h -E 'image: docker.io/prajwalnutant/.+:' k8s/*.yaml | awk '{print $2}'); do
+    tag="${line##*:}"
+    if [ "$tag" != "$VERSION" ]; then
+      echo "version mismatch: k8s image $line, VERSION is $VERSION" >&2
+      failed=1
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    echo "fix the stamps or re-run with --set-version $VERSION (or --skip-version-check)" >&2
+    return 1
+  fi
+  echo "version stamps match $VERSION"
+}
+
+# ./... also descends into frontend/node_modules. That tree is not a Go
+# package, and npm ci removes it while preflight runs, so a scope directory
+# such as @oxc-project disappears mid-walk.
+GO_PKGS=". ./cmd/... ./internal/... ./tools/..."
+
+update_deps() {
+  echo "updating Go modules..."
+  go get -u $GO_PKGS
+  go mod tidy
+  echo "updating frontend npm packages..."
+  (cd frontend && run_npm update && run_npm audit --omit=dev)
+  if ! command -v govulncheck >/dev/null 2>&1; then
+    go install golang.org/x/vuln/cmd/govulncheck@latest
+    export PATH="$(go env GOPATH)/bin:${PATH}"
+  fi
+  govulncheck $GO_PKGS
+  echo "dependency update finished; review git diff before committing"
+}
+
+BUILD_DATE="${BUILD_DATE:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
+GO_VER="${GO_VER:-$(go version | awk '{print $3}')}"
+GIT_REVISION="${GIT_REVISION:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+GIT_DIRTY=""
+if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+  GIT_DIRTY="-dirty"
+fi
+if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "$GIT_DIRTY" ]; then
+  die "worktree is dirty; commit or stash, or omit --require-clean"
+fi
+
+LDFLAGS="-w -s -X main.Version=${VERSION}${GIT_DIRTY} -X main.GitRevision=${GIT_REVISION} -X main.BuildDate=${BUILD_DATE} -X main.Stream=${STREAM} -X main.GoVersion=${GO_VER}"
+if [ -n "${NCC_RELEASE_PUBKEY:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.releaseSigningPublicKeyB64=${NCC_RELEASE_PUBKEY}"
+fi
+export VERSION STREAM BUILD_DATE GO_VER GIT_REVISION GIT_DIRTY LDFLAGS
+
+if [ "$PRINT_LDFLAGS" = 1 ]; then
+  printf '%s\n' "$LDFLAGS"
+  exit 0
+fi
+
+if [ -z "$DOCKER_ARCH" ]; then
+  if in_csv "$ARCH_LIST" amd64; then
+    DOCKER_ARCH="amd64"
+  else
+    DOCKER_ARCH="${ARCH_LIST%%,*}"
+  fi
+fi
+if [ "$DO_DOCKER" = 1 ]; then
+  # The published tag is name:VERSION. One tag is one image, so extra
+  # architectures are not given their own name:VERSION-arch tags.
+  if [ "$DOCKER_ARCH" != "${DOCKER_ARCH%%,*}" ]; then
+    echo "image tag is :${VERSION}; using linux/${DOCKER_ARCH%%,*} only"
+  fi
+  DOCKER_ARCH="${DOCKER_ARCH%%,*}"
+fi
+if [ "$IMAGES_ONLY" = 1 ]; then
+  ARCH_LIST="$DOCKER_ARCH"
+fi
+
+resolve_container_engine() {
+  local want="${ENGINE_ARG:-${NCC_CONTAINER_ENGINE:-}}"
+  if [ -n "$want" ]; then
+    case "$want" in
+      docker|podman) ;;
+      *) die "--engine must be docker or podman" ;;
+    esac
+    command -v "$want" >/dev/null 2>&1 || die "$want was not found on PATH"
+    ENGINE="$want"
+    return
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then
+    ENGINE=podman
+  else
+    die "docker or podman is required for --docker. A shell alias such as alias docker=podman is not visible to this script; pass --engine podman"
+  fi
+}
+
+ENGINE=""
+if [ "$DO_DOCKER" = 1 ]; then
+  resolve_container_engine
+fi
+
+echo "plan host=${HOST_KERNEL} version=${VERSION}${GIT_DIRTY} stream=${STREAM} go=${GO_VER}"
+echo "plan os=${OS_LIST} arch=${ARCH_LIST} jobs=${JOBS} stacks=$([ "$NO_STACKS" = 1 ] && echo no || echo yes) docker=$([ "$DO_DOCKER" = 1 ] && echo yes || echo no) images_only=$([ "$IMAGES_ONLY" = 1 ] && echo yes || echo no) engine=${ENGINE:-none} push=$([ "$DO_PUSH" = 1 ] && echo yes || echo no)"
+if [ "$DO_DOCKER" = 1 ]; then
+  echo "plan image tag=${REGISTRY}/${IMAGE_PREFIX}/<name>:${VERSION} linux/${DOCKER_ARCH}"
+fi
+echo "plan ldflags=${LDFLAGS}"
+
+if [ "$DRY_RUN" = 1 ]; then
+  if [ -n "$SET_VERSION" ]; then
+    echo "dry-run: would stamp version $SET_VERSION across VERSION, frontend, helm, and k8s"
+  fi
+  if [ "$UPDATE_DEPS" = 1 ]; then
+    echo "dry-run: would update Go modules and npm packages"
+  fi
+  if [ "$SKIP_VERSION_CHECK" != 1 ] && [ -z "$SET_VERSION" ]; then
+    check_versions
+  fi
+  echo "DRY_RUN"
+  exit 0
+fi
+
+if [ -n "$SET_VERSION" ]; then
+  run_python -c 'import sys' >/dev/null 2>&1 || die "--set-version requires python"
+  stamp_version "$SET_VERSION"
+fi
+
+if [ "$SKIP_VERSION_CHECK" != 1 ]; then
+  check_versions
+fi
+
+if [ "$UPDATE_DEPS" = 1 ]; then
+  update_deps
+  GO_VER="$(go version | awk '{print $3}')"
+  LDFLAGS="-w -s -X main.Version=${VERSION}${GIT_DIRTY} -X main.GitRevision=${GIT_REVISION} -X main.BuildDate=${BUILD_DATE} -X main.Stream=${STREAM} -X main.GoVersion=${GO_VER}"
+  if [ -n "${NCC_RELEASE_PUBKEY:-}" ]; then
+    LDFLAGS="${LDFLAGS} -X main.releaseSigningPublicKeyB64=${NCC_RELEASE_PUBKEY}"
+  fi
+  export LDFLAGS GO_VER
+fi
+
+rm -rf dist
+mkdir -p dist
+
+NEED_FRONTEND=0
+if [ "$NO_STACKS" != 1 ] || [ "$DO_DOCKER" = 1 ]; then
+  NEED_FRONTEND=1
+fi
+
+FRONTEND_PID=""
+cleanup_frontend() {
+  if [ -n "${FRONTEND_PID:-}" ]; then
+    kill "$FRONTEND_PID" >/dev/null 2>&1 || true
+    wait "$FRONTEND_PID" >/dev/null 2>&1 || true
+    FRONTEND_PID=""
+  fi
+}
+trap cleanup_frontend EXIT
+
+if [ "$NEED_FRONTEND" = 1 ] && [ "$SKIP_FRONTEND" != 1 ]; then
+  (
+    set -euo pipefail
+    cd frontend
+    run_npm ci
+    run_npm run build
+  ) >dist/frontend-build.log 2>&1 &
+  FRONTEND_PID=$!
+  echo "frontend build started (pid ${FRONTEND_PID}, log dist/frontend-build.log)"
+fi
+
+if [ "$SKIP_PREFLIGHT" != 1 ]; then
+  go mod download
+  go mod verify
+  go vet $GO_PKGS
+  if [ "$SKIP_TESTS" = 1 ]; then
+    echo "[SKIP] go test"
+  else
+    testlog=dist/go-test.log
+    if ! go test $GO_PKGS -count=1 -short >"$testlog" 2>&1; then
+      tail -200 "$testlog" >&2
+      exit 1
+    fi
+    echo "go test ok"
+  fi
+else
+  echo "[SKIP] preflight"
+fi
+
+if [ "$DO_GOVULN" = 1 ]; then
+  if ! command -v govulncheck >/dev/null 2>&1; then
+    go install golang.org/x/vuln/cmd/govulncheck@latest
+    export PATH="$(go env GOPATH)/bin:${PATH}"
+  fi
+  govulncheck $GO_PKGS
+fi
+echo "PREFLIGHT_OK"
+
+if in_csv "$OS_LIST" windows; then
+  GIT_REV_SHORT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+  for arch in $(echo "$ARCH_LIST" | tr ',' ' '); do
+    go run ./tools/winversioninfo --version="$VERSION" --git-rev="$GIT_REV_SHORT" --output-dir=. --arch="$arch"
+  done
+fi
+
+build_one() {
+  local goos="$1" goarch="$2" pkg="$3" name ext flags
+  ext=""
+  if [ "$goos" = "windows" ]; then
+    ext=".exe"
+  fi
+  if [ "$pkg" = "." ]; then
+    name="ncc-orchestrator"
+  else
+    name=$(basename "$pkg")
+  fi
+  flags="$LDFLAGS"
+  if [ "$name" = "ncc-mcp-server" ]; then
+    flags="$flags -X main.serverVersion=${VERSION}${GIT_DIRTY}"
+  fi
+  echo "build ${name}-${goos}-${goarch}${ext}"
+  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -buildvcs=true -ldflags "$flags" -o "dist/${name}-${goos}-${goarch}${ext}" "$pkg"
+}
+
+wait_batch() {
+  local pid
+  for pid in "$@"; do
+    wait "$pid"
+  done
+}
+
+PKGS=". ./cmd/ncc-api-server ./cmd/ncc-ui-server"
+if [ "$WITH_MCP" = 1 ]; then
+  PKGS="$PKGS ./cmd/ncc-mcp-server"
+fi
+
+pids=()
+for goos in $(echo "$OS_LIST" | tr ',' ' '); do
+  for goarch in $(echo "$ARCH_LIST" | tr ',' ' '); do
+    for pkg in $PKGS; do
+      build_one "$goos" "$goarch" "$pkg" &
+      pids+=("$!")
+      if [ "${#pids[@]}" -ge "$JOBS" ]; then
+        wait_batch "${pids[@]}"
+        pids=()
+      fi
+    done
+  done
+done
+if [ "${#pids[@]}" -gt 0 ]; then
+  wait_batch "${pids[@]}"
+fi
+rm -f resource_windows_*.syso cmd/ncc-api-server/resource_windows_*.syso cmd/ncc-ui-server/resource_windows_*.syso
+
+LOCAL_OS=$(go env GOOS)
+LOCAL_ARCH=$(go env GOARCH)
+LOCAL_EXT=""
+if [ "$LOCAL_OS" = "windows" ]; then
+  LOCAL_EXT=".exe"
+fi
+if in_csv "$OS_LIST" "$LOCAL_OS" && in_csv "$ARCH_LIST" "$LOCAL_ARCH"; then
+  for n in ncc-orchestrator ncc-api-server ncc-ui-server; do
+    link_or_copy "dist/${n}-${LOCAL_OS}-${LOCAL_ARCH}${LOCAL_EXT}" "dist/${n}${LOCAL_EXT}"
+  done
+fi
+
+verify_targets() {
+  local goos goarch name ext path bad=0
+  for goos in $(echo "$OS_LIST" | tr ',' ' '); do
+    for goarch in $(echo "$ARCH_LIST" | tr ',' ' '); do
+      ext=""
+      if [ "$goos" = "windows" ]; then
+        ext=".exe"
+      fi
+      names="ncc-orchestrator ncc-api-server ncc-ui-server"
+      if [ "$WITH_MCP" = 1 ]; then
+        names="${names} ncc-mcp-server"
+      fi
+      for name in $names; do
+        path="dist/${name}-${goos}-${goarch}${ext}"
+        if [ ! -f "$path" ]; then
+          echo "missing ${path}" >&2
+          bad=1
+          continue
+        fi
+        if ! assert_binary_kind "$path" "$goos"; then
+          bad=1
+          continue
+        fi
+        echo "ok ${goos}/${goarch} ${name}"
+      done
+    done
+  done
+  if [ "$bad" -ne 0 ]; then
+    echo "RELEASE_INCOMPLETE — one or more linux/mac/windows binaries failed the format check" >&2
+    return 1
+  fi
+}
+verify_targets
+
+sign_binaries() {
+  if [ -n "${NCC_MACOS_SIGN_IDENTITY:-}" ] && command -v codesign >/dev/null 2>&1 && in_csv "$OS_LIST" darwin; then
+    local f
+    shopt -s nullglob
+    for f in dist/ncc-orchestrator-darwin-* dist/ncc-api-server-darwin-* dist/ncc-ui-server-darwin-*; do
+      codesign --force --options runtime --timestamp --sign "$NCC_MACOS_SIGN_IDENTITY" "$f"
+      codesign --verify --strict --verbose=2 "$f"
+    done
+    if [ -n "${NCC_MACOS_NOTARY_PROFILE:-}" ] && command -v xcrun >/dev/null 2>&1; then
+      for f in dist/ncc-orchestrator-darwin-* dist/ncc-api-server-darwin-* dist/ncc-ui-server-darwin-*; do
+        ditto -c -k --keepParent "$f" "$f.zip"
+        xcrun notarytool submit "$f.zip" --keychain-profile "$NCC_MACOS_NOTARY_PROFILE" --wait
+        rm -f "$f.zip"
+      done
+    fi
+    shopt -u nullglob
+  fi
+  if [ -n "${NCC_WINDOWS_PFX_PATH:-}" ] && command -v osslsigncode >/dev/null 2>&1 && in_csv "$OS_LIST" windows; then
+    local f
+    shopt -s nullglob
+    for f in dist/ncc-orchestrator-windows-*.exe dist/ncc-api-server-windows-*.exe dist/ncc-ui-server-windows-*.exe; do
+      osslsigncode sign -pkcs12 "$NCC_WINDOWS_PFX_PATH" -pass "${NCC_WINDOWS_PFX_PASSWORD:-}" \
+        -h sha256 -t "${NCC_WINDOWS_TIMESTAMP_URL:-http://timestamp.digicert.com}" \
+        -n "NCC Orchestrator (open-source project)" \
+        -i "https://github.com/lTSPV75BRO/Nutanix-ncc-orchestrator" \
+        -in "$f" -out "$f.signed"
+      mv "$f.signed" "$f"
+    done
+    shopt -u nullglob
+  fi
+  if [ -n "${NCC_LINUX_GPG_KEY_ID:-}" ] && command -v gpg >/dev/null 2>&1 && in_csv "$OS_LIST" linux; then
+    local f
+    shopt -s nullglob
+    for f in dist/ncc-orchestrator-linux-*; do
+      gpg --batch --yes --local-user "$NCC_LINUX_GPG_KEY_ID" --detach-sign --armor --output "$f.asc" "$f"
+    done
+    shopt -u nullglob
+  fi
+}
+sign_binaries
+
+wait_frontend() {
+  if [ -z "${FRONTEND_PID:-}" ]; then
+    return 0
+  fi
+  if ! wait "$FRONTEND_PID"; then
+    echo "frontend build failed; last lines of dist/frontend-build.log:" >&2
+    tail -80 dist/frontend-build.log >&2 || true
+    FRONTEND_PID=""
+    return 1
+  fi
+  FRONTEND_PID=""
+  rm -rf dist/frontend-dist
+  cp -R frontend/dist dist/frontend-dist
+  echo "frontend-dist ready"
+}
+
+if [ "$NEED_FRONTEND" = 1 ]; then
+  if [ "$SKIP_FRONTEND" = 1 ]; then
+    if [ ! -d frontend/dist ]; then
+      die "frontend/dist is missing; run the SPA build or omit --skip-frontend"
+    fi
+    rm -rf dist/frontend-dist
+    cp -R frontend/dist dist/frontend-dist
+    echo "reused frontend/dist"
+  else
+    wait_frontend
+  fi
+fi
+
+if [ "$NO_STACKS" != 1 ]; then
+  cp example_config.yaml dist/ 2>/dev/null || true
+  if [ -f "RELEASE_NOTES_v${VERSION}.md" ]; then
+    cp "RELEASE_NOTES_v${VERSION}.md" dist/
+  fi
+  rm -rf dist/.stack
+  mkdir -p dist/.stack
+  for goos in $(echo "$OS_LIST" | tr ',' ' '); do
+    for goarch in $(echo "$ARCH_LIST" | tr ',' ' '); do
+      root="dist/.stack/${goos}-${goarch}"
+      ext=""
+      if [ "$goos" = "windows" ]; then
+        ext=".exe"
+      fi
+      rm -rf "$root"
+      mkdir -p "$root/bin"
+      cp "dist/ncc-orchestrator-${goos}-${goarch}${ext}" "$root/bin/ncc-orchestrator${ext}"
+      cp "dist/ncc-api-server-${goos}-${goarch}${ext}" "$root/bin/ncc-api-server${ext}"
+      cp "dist/ncc-ui-server-${goos}-${goarch}${ext}" "$root/bin/ncc-ui-server${ext}"
+      cp -R dist/frontend-dist "$root/frontend-dist"
+      if [ -f dist/example_config.yaml ]; then
+        cp dist/example_config.yaml "$root/"
+      fi
+      if [ "$goos" = "windows" ]; then
+        if [ -f "$root/example_config.yaml" ]; then
+          pack_zip "$root" "../../ncc-v2-stack-${goos}-${goarch}.zip" bin frontend-dist example_config.yaml
+        else
+          pack_zip "$root" "../../ncc-v2-stack-${goos}-${goarch}.zip" bin frontend-dist
+        fi
+      else
+        extra=""
+        if [ -f "$root/example_config.yaml" ]; then
+          extra="example_config.yaml"
+        fi
+        if ! (cd "$root" && COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "../../ncc-v2-stack-${goos}-${goarch}.tar.gz" bin frontend-dist $extra); then
+          (cd "$root" && COPYFILE_DISABLE=1 tar -czf "../../ncc-v2-stack-${goos}-${goarch}.tar.gz" bin frontend-dist $extra)
+        fi
+      fi
+      echo "stack ncc-v2-stack-${goos}-${goarch}"
+    done
+  done
+  if [ -n "${NCC_LINUX_GPG_KEY_ID:-}" ] && command -v gpg >/dev/null 2>&1; then
+    shopt -s nullglob
+    for f in dist/ncc-v2-stack-linux-*; do
+      gpg --batch --yes --local-user "$NCC_LINUX_GPG_KEY_ID" --detach-sign --armor --output "$f.asc" "$f"
+    done
+    shopt -u nullglob
+  fi
+
+  GIT_REV_FULL=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+  if [ -z "$GIT_DIRTY" ]; then
+    GIT_DIRTY_BOOL=false
+  else
+    GIT_DIRTY_BOOL=true
+  fi
+  {
+    echo "{"
+    echo "  \"product\": \"NCC Orchestrator\","
+    echo "  \"version\": \"${VERSION}\","
+    echo "  \"stream\": \"${STREAM}\","
+    echo "  \"build_date\": \"${BUILD_DATE}\","
+    echo "  \"git_revision\": \"${GIT_REV_FULL}\","
+    echo "  \"git_dirty\": ${GIT_DIRTY_BOOL},"
+    echo "  \"go_version\": \"${GO_VER}\","
+    echo "  \"build_host_os\": \"$(go env GOHOSTOS)\","
+    echo "  \"build_host_arch\": \"$(go env GOHOSTARCH)\","
+    echo "  \"project_url\": \"https://github.com/lTSPV75BRO/Nutanix-ncc-orchestrator\","
+    echo "  \"license\": \"MIT (see LICENSE in the source repository)\","
+    echo "  \"affiliation\": \"independent open-source project; not affiliated with or endorsed by Nutanix, Inc.\","
+    echo "  \"artifacts\": ["
+    first=1
+    shopt -s nullglob
+    for f in dist/ncc-orchestrator-* dist/ncc-v2-stack-* dist/example_config.yaml "dist/RELEASE_NOTES_v${VERSION}.md"; do
+      case "$f" in
+        *.asc|*.sig) continue ;;
+      esac
+      base=$(basename "$f")
+      sz=$(wc -c < "$f" | tr -d ' ')
+      sha=$(sha256_file "$f")
+      if [ "$first" -eq 1 ]; then
+        first=0
+      else
+        echo ","
+      fi
+      printf "    {\"name\": \"%s\", \"size\": %s, \"sha256\": \"%s\"}" "$base" "$sz" "$sha"
+    done
+    shopt -u nullglob
+    echo
+    echo "  ]"
+    echo "}"
+  } > dist/release-attestation.json
+  echo "wrote dist/release-attestation.json"
+
+  if [ "$SKIP_SBOM" != 1 ] && command -v cyclonedx-gomod >/dev/null 2>&1; then
+    for spec in "ncc-orchestrator:." "ncc-api-server:./cmd/ncc-api-server" "ncc-ui-server:./cmd/ncc-ui-server"; do
+      name="${spec%%:*}"
+      pkg="${spec##*:}"
+      cyclonedx-gomod app -licenses -json -main "$pkg" -output "dist/bom-${name}.cdx.json" -output-version 1.5
+    done
+    echo "wrote dist/bom-*.cdx.json"
+  elif [ "$SKIP_SBOM" != 1 ]; then
+    echo "skip SBOM: cyclonedx-gomod not installed (go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.7.0)"
+  fi
+
+  (
+    cd dist
+    : > checksums.txt
+    shopt -s nullglob
+    for f in ncc-orchestrator-* ncc-v2-stack-* example_config.yaml "RELEASE_NOTES_v${VERSION}.md" release-attestation.json bom-*.cdx.json; do
+      case "$f" in
+        *.asc|*.sig) continue ;;
+      esac
+      printf '%s  %s\n' "$(sha256_file "$f")" "$f" >> checksums.txt
+    done
+    shopt -u nullglob
+    sort -o checksums.txt checksums.txt
+  )
+  echo "wrote dist/checksums.txt"
+  if [ -n "${NCC_RELEASE_SIGN_KEY:-}" ]; then
+    go run . release-sign --key "${NCC_RELEASE_SIGN_KEY}" --in dist/checksums.txt --out dist/checksums.txt.sig
+    echo "wrote dist/checksums.txt.sig"
+  fi
+fi
+
+build_images() {
+  local arch stage name file tag_version tag_latest
+  if [ -z "$ENGINE" ]; then
+    resolve_container_engine
+  fi
+  if [ ! -d dist/frontend-dist ]; then
+    die "dist/frontend-dist is missing; do not combine --skip-frontend with --docker unless that directory already exists"
+  fi
+  # Podman prompts for short names such as alpine:3.24 when more than one
+  # registry is configured. Point those names at docker.io and do not ask.
+  if [ "$ENGINE" = "podman" ]; then
+    export CONTAINERS_SHORT_NAME_MODE=permissive
+  fi
+  sync_podman_trust
+  stage=dist/.image-context
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  arch="$DOCKER_ARCH"
+  for name in ncc-orchestrator ncc-api-server ncc-ui-server; do
+    if [ ! -f "dist/${name}-linux-${arch}" ]; then
+      die "missing dist/${name}-linux-${arch}; build it with --os linux --arch ${arch}"
+    fi
+    cp "dist/${name}-linux-${arch}" "$stage/"
+  done
+  cp -R dist/frontend-dist "$stage/frontend-dist"
+  collect_host_cas "$stage/ncc-host-cas.pem"
+  for spec in "deploy/docker/Dockerfile.runner|nutanix-ncc-orchestrator" "deploy/docker/Dockerfile.api|ncc-api-server" "deploy/docker/Dockerfile.ui|ncc-ui-server"; do
+    file="${spec%%|*}"
+    name="${spec##*|}"
+    tag_version="${REGISTRY}/${IMAGE_PREFIX}/${name}:${VERSION}"
+    echo "${ENGINE} build ${name} linux/${arch} ${tag_version}"
+    fmt=""
+    if [ "$ENGINE" = "podman" ]; then
+      # OCI images drop HEALTHCHECK. Docker format keeps it, matching docker build.
+      fmt="--format docker"
+    fi
+    # shellcheck disable=SC2086
+    "$ENGINE" build $fmt \
+      --platform "linux/${arch}" \
+      --build-arg "TARGETARCH=${arch}" \
+      --build-arg "VERSION=${VERSION}" \
+      --build-arg "STREAM=${STREAM}" \
+      --build-arg "GIT_REVISION=${GIT_REVISION}" \
+      --build-arg "BUILD_DATE=${BUILD_DATE}" \
+      -f "$file" \
+      -t "$tag_version" \
+      "$stage"
+    if [ "$DO_LATEST" = 1 ] && [ "$STREAM" = "Release" ]; then
+      tag_latest="${REGISTRY}/${IMAGE_PREFIX}/${name}:latest"
+      "$ENGINE" tag "$tag_version" "$tag_latest"
+    fi
+    if [ "$DO_PUSH" = 1 ]; then
+      "$ENGINE" push "$tag_version"
+      if [ "$DO_LATEST" = 1 ] && [ "$STREAM" = "Release" ]; then
+        "$ENGINE" push "${REGISTRY}/${IMAGE_PREFIX}/${name}:latest"
+      fi
+    fi
+  done
+  echo "DOCKER_OK engine=${ENGINE} registry=${REGISTRY} prefix=${IMAGE_PREFIX} version=${VERSION} stream=${STREAM} tag=${VERSION}"
+}
+
+# Public certificates from the host trust store. Used so a Podman machine can
+# pull base images through TLS inspection, and so apk can reach its mirror
+# during the image build. Private keys are never exported.
+collect_host_cas() {
+  local dest="$1"
+  : > "$dest"
+  if [ -n "${NCC_CONTAINER_CA:-}" ] && [ -f "$NCC_CONTAINER_CA" ]; then
+    cat "$NCC_CONTAINER_CA" >> "$dest"
+  fi
+  if [ "$HOST_KERNEL" = "darwin" ] && command -v security >/dev/null 2>&1; then
+    security find-certificate -a -p /Library/Keychains/System.keychain >> "$dest" 2>/dev/null || true
+    if [ -f "${HOME}/Library/Keychains/login.keychain-db" ]; then
+      security find-certificate -a -p "${HOME}/Library/Keychains/login.keychain-db" >> "$dest" 2>/dev/null || true
+    fi
+  elif [ "$HOST_KERNEL" = "linux" ]; then
+    if [ -d /usr/local/share/ca-certificates ]; then
+      cat /usr/local/share/ca-certificates/*.crt >> "$dest" 2>/dev/null || true
+    fi
+    if [ -d /etc/pki/ca-trust/source/anchors ]; then
+      cat /etc/pki/ca-trust/source/anchors/*.crt /etc/pki/ca-trust/source/anchors/*.pem >> "$dest" 2>/dev/null || true
+    fi
+  fi
+}
+
+sync_podman_trust() {
+  local pem remote sum current
+  [ "$ENGINE" = "podman" ] || return 0
+  remote=$("$ENGINE" info --format '{{.Host.ServiceIsRemote}}' 2>/dev/null || echo false)
+  [ "$remote" = "true" ] || return 0
+  pem=$(mktemp)
+  collect_host_cas "$pem"
+  if ! grep -q 'BEGIN CERTIFICATE' "$pem"; then
+    rm -f "$pem"
+    return 0
+  fi
+  if ! "$ENGINE" machine ssh -- true >/dev/null 2>&1; then
+    echo "podman: machine ssh is unavailable; registry pulls use the machine trust store as it is" >&2
+    rm -f "$pem"
+    return 0
+  fi
+  sum=$(sha256_file "$pem")
+  current=$("$ENGINE" machine ssh -- cat /etc/pki/ca-trust/source/anchors/ncc-host-cas.sha 2>/dev/null || true)
+  current=$(printf '%s' "$current" | tr -d '[:space:]')
+  if [ "$current" = "$sum" ]; then
+    rm -f "$pem"
+    echo "podman: host CA trust already installed in the machine"
+    return 0
+  fi
+  echo "podman: installing host CA certificates into the machine trust store"
+  "$ENGINE" machine ssh -- sudo tee /etc/pki/ca-trust/source/anchors/ncc-host-cas.pem >/dev/null < "$pem"
+  printf '%s\n' "$sum" | "$ENGINE" machine ssh -- sudo tee /etc/pki/ca-trust/source/anchors/ncc-host-cas.sha >/dev/null
+  if ! "$ENGINE" machine ssh -- sudo sh -c 'update-ca-trust extract >/dev/null 2>&1 || update-ca-certificates >/dev/null 2>&1'; then
+    echo "podman: could not refresh the machine trust store" >&2
+  fi
+  rm -f "$pem"
+}
+
+if [ "$DO_DOCKER" = 1 ]; then
+  build_images
+fi
+
+OS_N=$(csv_count "$OS_LIST")
+ARCH_N=$(csv_count "$ARCH_LIST")
+EXPECT_STACKS=$((OS_N * ARCH_N))
+EXPECT_BINS=$((EXPECT_STACKS * 3))
+GOT_BINS=$(count_matches "dist/ncc-orchestrator-* dist/ncc-api-server-* dist/ncc-ui-server-*")
+if [ "$NO_STACKS" != 1 ]; then
+  GOT_STACKS=$(count_matches "dist/ncc-v2-stack-*")
+  echo "stacks=${GOT_STACKS} (expect ${EXPECT_STACKS}), binaries=${GOT_BINS} (expect ${EXPECT_BINS})"
+  if [ "$GOT_STACKS" != "$EXPECT_STACKS" ] || [ "$GOT_BINS" != "$EXPECT_BINS" ]; then
+    echo "RELEASE_INCOMPLETE" >&2
+    exit 1
+  fi
+else
+  echo "binaries=${GOT_BINS} (expect ${EXPECT_BINS})"
+  if [ "$GOT_BINS" != "$EXPECT_BINS" ]; then
+    echo "RELEASE_INCOMPLETE" >&2
+    exit 1
+  fi
+fi
+
+trap - EXIT
+ELAPSED=$(( $(date +%s) - START_EPOCH ))
+echo "elapsed=${ELAPSED}s"
+echo "RELEASE_OK"

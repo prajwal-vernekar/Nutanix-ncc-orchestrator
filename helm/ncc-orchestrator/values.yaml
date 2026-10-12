@@ -1,0 +1,61 @@
+namespace: ncc-orchestrator-v2
+
+images:
+  runner:
+    repository: docker.io/prajwalnutant/nutanix-ncc-orchestrator
+    tag: "2.2.0"
+    pullPolicy: IfNotPresent
+  api:
+    repository: docker.io/prajwalnutant/ncc-api-server
+    tag: "2.2.0"
+    pullPolicy: IfNotPresent
+  ui:
+    repository: docker.io/prajwalnutant/ncc-ui-server
+    tag: "2.2.0"
+    pullPolicy: IfNotPresent
+
+image:
+  repository: docker.io/prajwalnutant/nutanix-ncc-orchestrator
+  tag: "2.2.0"
+  pullPolicy: IfNotPresent
+
+cronjob:
+  schedule: "15 */4 * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  startingDeadlineSeconds: 900
+
+api:
+  enabled: true
+  replicas: 2
+  service:
+    port: 8081
+
+ui:
+  enabled: true
+  replicas: 2
+  service:
+    type: LoadBalancer
+    port: 80
+  origin: https://ncc.example.com
+
+ingress:
+  enabled: false
+  className: nginx
+  host: ncc.example.com
+  tlsSecret: ncc-v2-ui-tls
+  certManager:
+    enabled: false
+    clusterIssuer: letsencrypt-prod
+
+resources:
+  api: {}
+  ui: {}
+
+configMapName: ncc-orchestrator-config
+pvcName: ncc-orchestrator-output
+secretName: ncc-orchestrator-credentials
+
+initImage: busybox:1.37
